@@ -41,14 +41,9 @@ device-held key. It does **not** prove the action _succeeded_ in the world. Neve
 write code, copy, or comments that claim more. Never synthesize governance
 numbers (receipt/approval/block counts must be real or honestly empty).
 
-All packages are at `0.1.1`. Wire format: `alg = "heso-action/v2+ed25519"`,
+All packages are at `0.4.0` on public npm and PyPI (`pip install heso`,
+`npm install @hesohq/sdk`). Wire format: `alg = "heso-action/v2+ed25519"`,
 `action_version = "heso-action/2.0"`.
-
-> **Registry status:** the public npm/PyPI publish of these packages is pending.
-> Until it lands, `@hesohq/*` is not on public npm, and `pip install heso` from
-> public PyPI fetches an **unrelated older project** (version `0.3.0`) — not this
-> SDK. Confirm the installed package matches the `0.1.1` surface described here
-> before wiring anything; otherwise install from the team's configured registry.
 
 ## Pick the package first
 
