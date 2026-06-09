@@ -50,17 +50,13 @@ run()
 | Decorator | Verb | Notes |
 | --- | --- | --- |
 | `@heso.tool` | `tool_call` | `redact: list[str]` for commit-and-reveal redaction. |
-| `@heso.destructive` | `delete` | Rides a pinned floor — can't be allowed without approval. |
-| `@heso.action` | custom | Build an `Action` manually for a specific verb. |
+| `@heso.destructive` | `delete` | Rides a pinned floor — can't be allowed without approval. Redacts destructively. |
+| `@heso.action("domain.action_id")` | (label) | Declare the fine catalog action on a gated function — a descriptive label stamped on the receipt; the coarse verb stays authoritative. |
 
 ```python
 @heso.tool
 def search(query: str) -> str:
     return web.search(query)          # body runs only if policy allows
-
-@heso.tool(blocking=False)            # observe-only: refused actions captured + signed, no raise
-def shadow_search(query: str) -> str:
-    return web.search(query)
 
 @heso.destructive
 def delete_record(record_id: str) -> None:
@@ -71,8 +67,9 @@ def call_partner_api(api_key: str, endpoint: str) -> dict:
     return requests.get(endpoint, headers={"Authorization": api_key}).json()
 ```
 
-**Blocking** is the default (`blocking=True`): a blocked action raises
-`BlockedError` *before* the body runs. `blocking=False` is shadow mode — useful to
+**Blocking** is the default (`blocking=True`, set on `heso.init`, not per-decorator):
+a blocked action raises `BlockedError` *before* the body runs. `blocking=False` is
+shadow mode — useful to
 roll HESO out and collect receipts (including for what *would* be blocked) without
 changing behavior, then flip to blocking once the policy looks right.
 
@@ -138,12 +135,20 @@ a manually-built `Action`.
 
 ## Adapters
 
-- **LangChain:** add `heso.HesoCallbackHandler()` to your `AgentExecutor`
-  callbacks; tool calls in the agent are captured and gated.
+All drop-ins are exposed **lazily**, so a bare `import heso` never imports a
+framework you aren't using. Each runs every call through the same gate as the
+decorators.
+
+- **LangChain / LangGraph:** add `heso.HesoCallbackHandler()` to your
+  `AgentExecutor` callbacks; tool calls in the agent are captured and gated.
   ```python
   executor = AgentExecutor(agent=agent, tools=tools, callbacks=[heso.HesoCallbackHandler()])
   ```
 - **OpenAI / Anthropic:** wrap the client with `heso.wrap()` (above).
+- **Framework namespaces** (reached as `heso.<name>` after a bare `import heso`):
+  `heso.crewai` (e.g. `heso.crewai.heso_before_hook`), `heso.openai_agents`,
+  `heso.claude_agent`, `heso.pydantic_ai`, `heso.langgraph`, and `heso.mcp`
+  (e.g. `heso.mcp.wrap_call_tool` to gate MCP tool calls).
 
 ## Exported types
 

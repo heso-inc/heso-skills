@@ -81,7 +81,9 @@ composer (`composeConditionDisplay`) so the live sentence stays honest.
 
 - **Simulate** (`/policy/simulate`): run a captured action against the working
   (unsaved) policy and see which rule matches and what it decides — before
-  shipping. Backed by the same evaluator the engine uses (`evaluatePolicy`).
+  shipping. The dashboard runs the real first-match-wins engine for this; there is
+  no `evaluatePolicy` in the verify-wasm surface (client-side you have
+  `parsePolicy` / `policyRulesFromToml` / `ruleToSentence` / `validateNoFloorBypass`).
 - **Deploy**: edits are held client-side until you deploy. A persistent
   **Review & sign** bar (visible on every policy sub-route while there are
   unsaved changes) deploys to the Rust engine — `deployPolicy(rules, policyHash)`
