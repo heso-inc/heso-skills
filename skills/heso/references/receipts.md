@@ -11,7 +11,7 @@ snake_case on the wire.
 
 | Field | Type | Req | Meaning |
 | --- | --- | --- | --- |
-| `alg` | `"heso-action/v2+ed25519"` | ✓ | Algorithm tag. Checked first; unknown → `wrong_algorithm`. |
+| `alg` | `"heso-action/v2+ed25519"` | ✓ | Algorithm tag. Checked first; unknown → `WrongAlgorithm`. |
 | `content` | `ActionContent` | ✓ | The signed body — everything the signatures cover. |
 | `signatures` | `SignatureEntry[]` | ✓ | Ed25519 signatures over the canonical content. Operator always; approver at L1. |
 | `transparency` | `unknown[]` | | Optional RFC-6962 Merkle inclusion/consistency proofs (SHA-256). Absent until logged. |
@@ -24,15 +24,24 @@ BLAKE3 digest of.
 
 | Field | Type | Req | Meaning |
 | --- | --- | --- | --- |
-| `action_version` | `"heso-action/2.0"` | ✓ | Schema version. Unknown → `unsupported_version`. |
+| `action_version` | `"heso-action/2.0"` | ✓ | Schema version. Unknown → `Unsupported`. |
 | `captured_at` | string (ISO-8601) | ✓ | When the action was captured, before the policy decision. |
 | `agent_identity` | string | ✓ | Operator public key, base64 — the identity that signs. |
 | `action` | `ActionDetail` | ✓ | What the agent did (below). |
 | `policy` | `PolicyOutcome` | ✓ | The rule that matched and the path taken (below). |
 | `approver_decision` | `ApproverRecord` | | Present when routed to a human (below). |
 | `redaction` | `RedactionRecord` | | Present when fields were redacted before signing (below). |
-| `trust_level` | `"L0" \| "L1"` | ✓ | Claimed trust. Re-derived on verify; mismatch → `trust_mismatch`. No L2/L3. |
-| `action_hash` | string | ✓ | BLAKE3 of the canonical content, lowercase 64-hex. Recomputed on verify; differ → `hash_mismatch`. Stripped before hashing. |
+| `trust_level` | `"L0" \| "L1"` | ✓ | Claimed trust. Re-derived on verify; mismatch → `TrustLevelMismatch`. No L2/L3. |
+| `action_hash` | string | ✓ | BLAKE3 of the canonical content, lowercase 64-hex. Recomputed on verify; differ → `HashMismatch`. Stripped before hashing. |
+
+**v2 signed-content (reserved-absent).** A standalone receipt omits these and
+canonicalizes byte-identically to one minted before they existed, but `content`
+may also carry: a chain block (`session_id`, `seq`, `prev_receipt_hash`), a
+trusted-time `time_anchor` (RFC-3161 → `TimeAnchorUnverifiable` if present and
+bad), descriptive `action.domain` / `action.action` labels, a re-derivable
+`action.ert` (classification), a payment `action.mandate`, a `guardrail` record,
+and the suspend/resume `kind` / `suspension` / `key_rotation`. All are signed; the
+coarse `verb` stays the authoritative lane every decision keys on.
 
 ## ActionDetail
 
@@ -74,7 +83,7 @@ approver signs with their own device-held key — the cloud holds no signing key
 | `algorithm` | `"Ed25519"` | ✓ | Always Ed25519. |
 | `key_id` | `"operator" \| "approver"` | ✓ | Which key produced the signature. |
 | `public_key` | string | ✓ | Signing public key, base64. The verifier checks against this. |
-| `signature` | string | ✓ | Ed25519 signature over the canonical content, base64. Bad operator sig → `invalid_signature`; bad approver sig → `invalid_approver`. |
+| `signature` | string | ✓ | Ed25519 signature over the canonical content, base64. Bad operator sig → `InvalidSignature`; bad approver sig → `InvalidSignature` (or `SelfApproval` if the approver key equals the operator's). |
 
 ## ApproverRecord (`content.approver_decision`)
 
@@ -97,7 +106,7 @@ approver signs with their own device-held key — the cloud holds no signing key
 `RedactionMarker` = `{ field_path: string, algorithm: "blake3", commitment: string }`.
 `field_path` e.g. `action.fields.member_id`. `commitment` is a 64-hex BLAKE3
 digest in `commit_and_reveal` mode, or an **empty string** in `destructive` mode —
-never omitted. A malformed marker → `redaction_malformed`.
+never omitted. A malformed marker → `MalformedRedaction`.
 
 ## Worked example — an L1 payment receipt
 

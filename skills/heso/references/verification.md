@@ -9,51 +9,60 @@ receipt.
 
 ```ts
 // Node
-import { verify } from "@heso/core"
+import { verify } from "@hesohq/core"
 const r = verify(receiptBytes)        // { verdict, trustLevel }
 
 // Browser — await init() once first
-import init, { verifyActionReceipt } from "@heso/verify-wasm"
+import init, { verifyActionReceipt } from "@hesohq/verify-wasm"
 await init()
 const v = verifyActionReceipt(bytes)  // { verdict, trust_level }
 ```
 
 ```python
-from heso import verify_action_receipt
-result = verify_action_receipt(receipt)   # result.state == "valid" | "<gate>"
+from heso._core import verify_action_receipt
+result = verify_action_receipt(receipt_json)   # { "kind", "detail", "trust_level" }
+result["kind"]   # "Valid" | "HashMismatch" | ...
 ```
 
-## The seven gates (in order)
+## The gates (in order)
 
 The verifier walks these top to bottom and stops at the **first** failure,
 reporting one verdict. It does not collect every problem — it names the earliest
 defect, so two verifiers given the same receipt agree on the same single answer.
-Passing all seven yields `valid`.
+The seven core gates run on every receipt; gates 8–10 run only when the receipt
+carries the field they check. Passing yields `Valid`.
 
 | # | Gate | Checks | Fail verdict |
 | --- | --- | --- | --- |
-| 1 | Algorithm recognized | `alg == "heso-action/v2+ed25519"` | `wrong_algorithm` |
-| 2 | Version recognized | `action_version == "heso-action/2.0"` | `unsupported_version` |
-| 3 | Hash recomputes | BLAKE3 of canonical bytes == embedded `action_hash` | `hash_mismatch` |
-| 4 | Operator signature verifies | Ed25519 under `key_id:"operator"` vs operator key | `invalid_signature` |
-| 5 | Approver signature verifies | If present (L1), Ed25519 vs approver key | `invalid_approver` |
-| 6 | Redaction markers well-formed | Markers structurally valid for their mode | `redaction_malformed` |
-| 7 | Trust re-derives | Level derived from passing signatures == claimed `trust_level` | `trust_mismatch` |
+| 1 | Algorithm recognized | `alg == "heso-action/v2+ed25519"` | `WrongAlgorithm` |
+| 2 | Version recognized | `action_version == "heso-action/2.0"` | `Unsupported` |
+| 3 | Hash recomputes | BLAKE3 of canonical bytes == embedded `action_hash` | `HashMismatch` |
+| 4 | Operator signature verifies | Ed25519 under `key_id:"operator"` vs operator key | `InvalidSignature` / `Malformed` |
+| 5 | Approver signature verifies | If present (L1), Ed25519 vs approver key, AND approver ≠ operator | `InvalidSignature` / `SelfApproval` |
+| 6 | Redaction markers well-formed | Markers structurally valid for their mode | `MalformedRedaction` |
+| 7 | Trust re-derives | Level derived from passing signatures == claimed `trust_level` | `TrustLevelMismatch` |
+| 8 | Trusted-time anchor (if present) | RFC-3161 anchor verifies vs a pinned TSA root | `TimeAnchorUnverifiable` |
+| 9 | Payment mandate (if present) | A `payment`'s mandate binding is not invalid/absent | `MandateRejected` |
+| 10 | Classification (re-deriving verify only) | Signed ERT replays from its facts | `ClassificationMismatch` / `TaxonomyUnavailable` |
 
-Because trust is the **last** gate and is re-derived rather than read, a receipt
-can never claim more than its signatures support. A receipt with both a tampered
-field and a bad signature reports `hash_mismatch` (gate 3 comes first).
+Because trust is the **last core** gate and is re-derived rather than read, a
+receipt can never claim more than its signatures support. A receipt with both a
+tampered field and a bad signature reports `HashMismatch` (gate 3 comes first).
 
 ## Verdict strings
 
-`@heso/core` / Python return snake_case: `valid`, `wrong_algorithm`,
-`unsupported_version`, `hash_mismatch`, `invalid_signature`, `invalid_approver`,
-`redaction_malformed`, `trust_mismatch` (plus `Malformed:…` for unparseable
-input). `@heso/sdk`'s `gate()` returns the same lower-case verdict on
-`GateResult.verdict`. The browser WASM returns PascalCase variants
-(`Valid`, `HashMismatch`, `InvalidSignature:…`, `TrustLevelMismatch:…`) — same
-gates, different casing. Always branch on the value the surface you're using
-returns; don't assume one casing.
+All SDK surfaces return the **PascalCase engine tag**: `Valid`,
+`WrongAlgorithm:…`, `Unsupported:…`, `HashMismatch`, `InvalidSignature:…`,
+`MalformedRedaction:…`, `TrustLevelMismatch:…`, `Malformed:…`, `SelfApproval`,
+`TimeAnchorUnverifiable:…`, `MandateRejected:…`, `ClassificationMismatch:…`,
+`TaxonomyUnavailable:…`. Node (`verify`) and the browser WASM
+(`verifyActionReceipt`) put it on `result.verdict`; `@hesohq/sdk`'s `gate()`
+returns it verbatim on `GateResult.verdict`; the Python wheel returns it as the
+`kind` of a `{ kind, detail, trust_level }` dict. There is **no**
+`invalid_approver` verdict — a bad approver co-sign is `InvalidSignature`, and an
+operator approving its own action is `SelfApproval`. The HESO console maps these
+tags to friendlier snake_case copy for display, but the tag is the contract you
+branch on.
 
 ## Byte-for-byte canonicalization
 
@@ -64,8 +73,8 @@ before hashing — you cannot hash a value into itself.
 
 **Never write your own canonicalizer.** Your own JCS that orders keys or formats
 numbers even slightly differently produces different bytes, a different BLAKE3
-hash, and a false `hash_mismatch` on a receipt that is actually valid. Always
-route through the core — `@heso/core`, `@heso/verify-wasm`, or the Python `heso`
+hash, and a false `HashMismatch` on a receipt that is actually valid. Always
+route through the core — `@hesohq/core`, `@hesohq/verify-wasm`, or the Python `heso`
 package. Never rebuild canonical bytes by hand. The browser must call the shared
 Rust canonicalizer, not JS code.
 
