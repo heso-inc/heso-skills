@@ -42,8 +42,23 @@ engine.recordResult(action, result)         // bind result to a follow-up receip
 - Adapters: `aiSdk.gateTool` / `aiSdk.gateTools`, `mastra.*` — thin wrappers over
   the engine core (also at `@hesohq/sdk/adapters/*`).
 - **Two-phase approval:** `engine.gate` throws `SuspendedError(actionHash)`; out of
-  band, `waitForApproval(actionHash)` → `finalizeL1(parts.suspendedContent, parts)`
+  band, `waitForApproval(actionHash)` → `finalizeL1(suspendedContent, parts)`
   assembles + mirrors the L1. A rejected decision throws `ApprovalRejectedError`.
+- **Console co-sign (how the approval is produced).** The human approves in the web
+  console and co-signs **in their browser** with a per-device WebCrypto key; the
+  thin cloud relays the detached co-signature (it holds **no** key). `getL1Parts`
+  (or `waitForApproval`) returns that relayed record + co-signature, and `finalizeL1`
+  re-mints the L1 in-core and locally re-verifies `Valid(L1)` before pushing.
+- **Quorum (k-of-n):** `getQuorumParts(actionHash)` returns all relayed legs;
+  `finalizeQuorum(suspendedContent, parts, opts?)` assembles a quorum receipt that
+  re-derives to **L1 with a `multi_approval` block** — not a higher level, and
+  honestly narrower per approver (the operator signs only action + threshold +
+  roster). Under-quorum at verify is `ThresholdNotMet`.
+- **Key rotation fails closed.** If the operator key rotates between suspend and
+  finalize, the in-core assemble rejects it (`OperatorKeyMismatchError`). Pass
+  `finalizeQuorum`'s `loadedOperatorPubkeyB64` for the proactive check and
+  `onKeyRotation` to auto-recover: it re-suspends under the new key (a fresh
+  `action_hash` via `ReSuspendResult`) instead of minting under a stale one.
 
 The deepest capture surface is still the Python SDK (more adapters, suspend/
 resume); on Node the same one Rust core does the work.
@@ -109,8 +124,9 @@ resolved from the api-key — there is **no team id**; approvals are keyed by
 | `pushReceipt(receipt, supersedesActionHash?)` | POST `/v1/receipts` | `ReceiptPushResult` |
 | `pushReceipts(receipts[])` | loops POST `/v1/receipts` | `ReceiptPushResult[]` |
 | `pollApproval(actionHash)` | GET `/v1/approvals/{action_hash}` | `ApprovalView` |
-| `waitForApproval(actionHash, { pollIntervalMs?, timeoutMs? })` | polls (+ l1-parts on approval) | `ResolvedApproval` or throws |
-| `getL1Parts(actionHash)` | GET `/v1/approvals/{action_hash}/l1-parts` | `L1Parts` |
+| `waitForApproval(actionHash, { pollIntervalMs?, timeoutMs? })` | polls (+ one assembly GET on approval) | `ResolvedApproval` or throws |
+| `getL1Parts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads `legs[0]`) | `L1Parts` (single-approver) |
+| `getQuorumParts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads all `legs`) | `QuorumParts` (all k legs) |
 | `submitApprovalToken(actionHash, input)` | POST `/v1/approvals/{action_hash}/submit-token` | `ApprovalView` |
 
 `waitForApproval` defaults: `pollIntervalMs = 2000`, `timeoutMs = 300000`. There
@@ -136,7 +152,7 @@ operator delegation envelope so a customer co-signs from their own browser.
 
 `ActionReceipt`, `ActionContent`, `ActionDetail`, `PolicyOutcome`,
 `SignatureEntry`, `PolicyRule`, `Approval`, `GateResult`, `ReceiptPushResult`,
-`ApprovalView`, `L1Parts`, `Outcome`, `Action`, `TrustLevel` (`"L0" | "L1"`),
+`ApprovalView`, `L1Parts`, `QuorumParts`, `Outcome`, `Action`, `TrustLevel` (`"L0" | "L1"`),
 `Verb`, `DecisionPath` (`"allow" | "block" | "redact" | "require_approval"`),
 `ConditionOp` (the receipt subset).
 
@@ -145,8 +161,11 @@ operator delegation envelope so a customer co-signs from their own browser.
 When you need the primitives directly (`@hesohq/core` re-exports the native
 `@hesohq/node`):
 
-- `verify(bytes): { verdict, trustLevel }`, `verifyWithTime(bytes)` (adds RFC-3161
-  time status), `verifyRederiving(bytes)` (replays the signed classification).
+- `verify(bytes): { verdict, trustLevel }`, `verifyWithTime(bytes)` (adds a
+  `timeStatus`: `"NoTrustedTime"` when anchorless — the default — or
+  `"AnchoredRfc3161:<gen_time>"`; `gen_time` bounds when the **post-approval body**
+  existed, not when a human decided; a present-but-bad anchor fails the receipt),
+  `verifyRederiving(bytes)` (replays the signed classification).
 - Hashing/canonicalization: `contentHash`, `anchoredContentHashJs`,
   `actionCanonicalBytesJs`, `chainHashHex`, `shortHash`, `blake3Hex`.
 - Chains: `verifyChain`, `verifySessionChainJs`,
@@ -155,7 +174,8 @@ When you need the primitives directly (`@hesohq/core` re-exports the native
 - Approval / delegation: `verifyApprovalToken`, `verifyDelegation`.
 - Redaction: `redactDestructiveJs`, `redactCommitJs`.
 - Keys (Ed25519): `keyFromSeed(seed)`, `generateKey()`, `OperatorKey`.
-- Minting (process feature): `processAction`, `assembleL1FromParts`.
+- Minting (process feature): `processAction`, `assembleL1FromParts`,
+  `assembleQuorumFromParts` (the k-of-n sibling — both re-mint to L1).
 
 ## Honesty boundary
 

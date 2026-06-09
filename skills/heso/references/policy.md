@@ -38,7 +38,13 @@ A rule pins:
 - **scope** — a host glob matched against the action's `target_host`, or `"*"`.
 - **conditions** — zero or more field checks, a pure **AND** (all must hold).
 - **decision** — `allow` | `block` | `redact` | `require_approval`.
-- **approvers** + **sla_minutes** — for `require_approval`.
+- **approvers** + **sla_minutes** — for `require_approval`. A rule can require a
+  **quorum** — k distinct approvals rather than a single co-sign. Honest v1
+  semantics: this is "**k distinct registered org approvers**", recorded with
+  `threshold` = how many signed; a gate-time operator-pinned roster with a true
+  `k < n` (the eligible set fixed before any approver signs) is a **noted
+  follow-up**, not yet built. A quorum receipt re-derives to **L1** with a
+  `multi_approval` block — not a higher level.
 
 Each rule renders to a plain-English **sentence** (`rule_display`) via the
 Rust-faithful `ruleToSentence`, shown live as you author and stamped onto the
@@ -99,11 +105,27 @@ is **rejected at load** with a `[FLOOR_BYPASS]` error naming the offending rule 
 and verb. The two floors render in the read-only **Always-on** band; they are not
 editable rules.
 
+The human-approval floor is enforced in the **untrusted external-delegation** lane
+(the iframe/external-client path). An authenticated, role-gated, device-pinned
+**console approver** satisfies it **by identity** — they are the trusted human the
+floor exists to guarantee, so they don't traverse the iframe guard. This is a
+documented exemption, not a bypass.
+
 ## Default-deny
 
 Anything no rule matches is **blocked**. There is no implicit allow-all: an empty
 policy blocks everything, and you open lanes by adding rules. Combined with the
 floors, a policy gap fails safe rather than leaking a dangerous action through.
+
+## Trusted time (optional, Required-gated)
+
+Trusted time is **off by default** — most receipts carry no time anchor. A policy
+can mark trusted time **Required** for a lane; the engine then stamps the signed
+`anchor_policy = Required` on those receipts, and a receipt that lane produces must
+carry a verifiable RFC-3161 `time_anchor` or it **fails verification**
+(`AnchorRequired`). This is enforced by the **offline verifier itself**, not only by
+the server. The anchor bounds when the post-approval body existed — not when a human
+decided.
 
 ## `heso.toml` (the underlying format)
 

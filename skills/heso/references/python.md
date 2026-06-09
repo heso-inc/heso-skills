@@ -121,6 +121,30 @@ reaches **L1** and the work can resume. The lower-level suspend/resume API:
 - Outcome/marker types: `Gate`, `ResumeOutcome`, `SUSPENDED`, `DENIED`, `Paused`,
   `ContextLost`.
 
+**How the co-sign actually happens (console + relay).** A trusted, role-gated human
+approves in the web console and co-signs the action **in their browser** with a
+per-device key; the thin cloud relays the detached co-signature and **holds no
+signing key**. The operator side fetches the relayed parts and re-mints + locally
+re-verifies the L1 before pushing:
+
+- `heso.cloud.get_l1_parts(action_hash)` → `L1Parts`, then
+  `heso.finalize_l1(action_hash, suspended_content, parts)` assembles the
+  single-approver L1 and pushes it.
+- `heso.cloud.get_quorum_parts(action_hash)` → `QuorumParts`, then
+  `heso.finalize_quorum(action_hash, suspended_content, parts)` assembles a **k-of-n
+  quorum** receipt. A quorum re-derives to **L1 with a `multi_approval` block** — not
+  a higher level, and honestly narrower per approver (the operator signs only the
+  action + threshold + roster). Under-quorum at verify is `ThresholdNotMet`.
+- A non-approved record makes either finalize raise before touching the keystore;
+  every leg of a quorum must be `approved`.
+
+**Key rotation fails closed.** If the operator key rotates between suspend and
+finalize, the in-core assemble rejects the stale base (`OperatorKeyMismatchError`).
+`finalize_quorum` takes `loaded_operator_pubkey_b64` (proactive check) and an
+`on_key_rotation` callback that re-suspends under the new key — a fresh suspended L0
+with a new `action_hash` the approval re-opens against. Never a silent mint under a
+stale key.
+
 `heso.process(action: Action) -> Outcome` runs the full pipeline imperatively for
 a manually-built `Action`.
 
@@ -162,6 +186,10 @@ decorators.
 - An artifact anyone can **verify offline** with no HESO infrastructure. See
   [verification.md](verification.md).
 
+Capture timing (`captured_at`) is the operator's own clock — **informational only**.
+An optional RFC-3161 `time_anchor` can bind when the (post-approval) receipt body
+existed; it is off by default, so most receipts carry no trusted time.
+
 A receipt proves the operator *authorized* the action under a known policy, and at
-L1 that a person *approved* it. It does not prove the action *succeeded*
-downstream.
+L1 that one or more people *approved* it (single-approver, or a k-of-n quorum) with
+device-held keys. It does not prove the action *succeeded* downstream.

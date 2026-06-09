@@ -29,19 +29,24 @@ BLAKE3 digest of.
 | `agent_identity` | string | ✓ | Operator public key, base64 — the identity that signs. |
 | `action` | `ActionDetail` | ✓ | What the agent did (below). |
 | `policy` | `PolicyOutcome` | ✓ | The rule that matched and the path taken (below). |
-| `approver_decision` | `ApproverRecord` | | Present when routed to a human (below). |
+| `approver_decision` | `ApproverRecord` | | Present on a **single-approver** L1 (one human). Mutually exclusive with `multi_approval` — both present → `Malformed`. |
+| `multi_approval` | `MultiApproval` | | Present on a **quorum** (k-of-n) L1 (below). The block — never the level — distinguishes a quorum L1 from a single-approver L1; both re-derive to L1. |
+| `time_anchor` | `unknown` | | Optional RFC-3161 TSA token binding when the assembled post-approval body existed. Absent ⇒ no trusted time. Present-but-bad → `TimeAnchorUnverifiable`. |
+| `anchor_policy` | `"Required"` | | Signed marker that trusted time is required for this lane. If `Required` and `time_anchor` is absent → `AnchorRequired` (the offline verifier rejects it). |
 | `redaction` | `RedactionRecord` | | Present when fields were redacted before signing (below). |
-| `trust_level` | `"L0" \| "L1"` | ✓ | Claimed trust. Re-derived on verify; mismatch → `TrustLevelMismatch`. No L2/L3. |
+| `trust_level` | `"L0" \| "L1"` | ✓ | Claimed trust. Re-derived on verify; mismatch → `TrustLevelMismatch`. No L2/L3. L1 has two shapes — single-approver (`approver_decision`) and quorum (`multi_approval`) — told apart by which block is present, **never** by the level. |
 | `action_hash` | string | ✓ | BLAKE3 of the canonical content, lowercase 64-hex. Recomputed on verify; differ → `HashMismatch`. Stripped before hashing. |
 
 **v2 signed-content (reserved-absent).** A standalone receipt omits these and
 canonicalizes byte-identically to one minted before they existed, but `content`
 may also carry: a chain block (`session_id`, `seq`, `prev_receipt_hash`), a
 trusted-time `time_anchor` (RFC-3161 → `TimeAnchorUnverifiable` if present and
-bad), descriptive `action.domain` / `action.action` labels, a re-derivable
-`action.ert` (classification), a payment `action.mandate`, a `guardrail` record,
-and the suspend/resume `kind` / `suspension` / `key_rotation`. All are signed; the
-coarse `verb` stays the authoritative lane every decision keys on.
+bad) and its `anchor_policy` requirement (`Required` + no anchor → `AnchorRequired`),
+a quorum `multi_approval` block (k-of-n → still L1), descriptive `action.domain` /
+`action.action` labels, a re-derivable `action.ert` (classification), a payment
+`action.mandate`, a `guardrail` record, and the suspend/resume `kind` /
+`suspension` / `key_rotation`. All are signed; the coarse `verb` stays the
+authoritative lane every decision keys on.
 
 ## ActionDetail
 
@@ -92,8 +97,26 @@ approver signs with their own device-held key — the cloud holds no signing key
 | `decision` | `"approved" \| "rejected" \| "escalated"` | ✓ | What the human decided. |
 | `approver_identity` | string | ✓ | Approver public key, base64 — same key as the approver signature. |
 | `reason` | string | ✓ | The reason given. |
-| `decided_at` | string (ISO) | ✓ | When the decision was made. |
+| `decided_at` | string (ISO) | ✓ | When the approver claims they decided. **Approver-claimed**: bound only by that approver's own co-signature, never certified by a TSA. In a quorum it is bound *solely* by that one approver's leg — the operator does not sign over it. |
 | `sla_minutes` | number | | The SLA window the decision was expected within. |
+
+## MultiApproval (`content.multi_approval`)
+
+Present on a **quorum** (k-of-n) L1 receipt instead of `approver_decision`.
+
+| Field | Type | Req | Meaning |
+| --- | --- | --- | --- |
+| `threshold` | number | ✓ | How many distinct roster keys must co-sign (the `k` in k-of-n). The operator signs over it, so it can't be lowered after the fact. |
+| `roster` | string[] | ✓ | The sorted set of eligible approver public keys (base64) the operator signed over. An approver whose key is not on the roster is rejected (`Malformed`). |
+| `approvers` | `ApproverRecord[]` | ✓ | One record per approver who signed (same shape as `approver_decision`), sorted ascending by `approver_identity`. **Empty** in the operator base; the full `k`-element set on the wire. |
+
+The operator signs an **emptied-approvers base** (action + `threshold` + sorted
+`roster`) — *not* the individual approver records. Each approver's own
+co-signature is a separate `signatures[]` entry with `key_id: "approver"` (so a
+2-of-3 quorum has one operator entry plus two approver entries), and each is bound
+solely by that approver's own signature over the base-plus-only-their-own-record.
+A quorum re-derives to **L1** when ≥ `threshold` distinct roster keys verify; fewer
+→ `ThresholdNotMet`.
 
 ## RedactionRecord (`content.redaction`)
 
@@ -161,3 +184,44 @@ To check it: recompute `action_hash` over the canonical content, verify both
 Ed25519 signatures, confirm the redaction markers are well-formed, and re-derive
 the trust level from the signatures that passed. See
 [verification.md](verification.md).
+
+## Worked example — a 2-of-3 quorum receipt
+
+A payment gated to require **2 of 3** approvers. The receipt uses `multi_approval`
+instead of `approver_decision`, and carries one operator signature plus two approver
+signatures. It is still `trust_level: "L1"` — a quorum is **not** a higher level.
+
+```json
+{
+  "alg": "heso-action/v2+ed25519",
+  "content": {
+    "action_version": "heso-action/2.0",
+    "captured_at": "2026-06-06T14:22:09Z",
+    "agent_identity": "ed25519:uP3…b1",
+    "action": { "verb": "payment", "tool_name": "stripe.transfers.create", "target_host": "api.stripe.com", "workflow": "vendor-payouts", "account": "acct_19", "fields": { "amount_usd": "50000", "payee": "Globex LLC" } },
+    "policy": { "rule_id": "pay-cap-hi", "rule_display": "Require 2 approvers to pay over $25,000", "matched_conditions": [ { "field": "amount_usd", "op": "gt", "value": 25000 } ], "decision_path": "require_approval" },
+    "multi_approval": {
+      "threshold": 2,
+      "roster": [ "ed25519:aa1…", "ed25519:bb2…", "ed25519:cc3…" ],
+      "approvers": [
+        { "decision": "approved", "approver_identity": "ed25519:aa1…", "reason": "Matched PO-8841.", "decided_at": "2026-06-06T14:25:41Z", "sla_minutes": 120 },
+        { "decision": "approved", "approver_identity": "ed25519:bb2…", "reason": "Vendor on file; ok.", "decided_at": "2026-06-06T14:31:02Z", "sla_minutes": 120 }
+      ]
+    },
+    "trust_level": "L1",
+    "action_hash": "4d7a…0e55"
+  },
+  "signatures": [
+    { "algorithm": "Ed25519", "key_id": "operator", "public_key": "ed25519:uP3…b1", "signature": "9c01…aa3f" },
+    { "algorithm": "Ed25519", "key_id": "approver", "public_key": "ed25519:aa1…", "signature": "1f22…77b0" },
+    { "algorithm": "Ed25519", "key_id": "approver", "public_key": "ed25519:bb2…", "signature": "ab90…41ce" }
+  ]
+}
+```
+
+The operator signature covers the **emptied-approvers base** — action + `threshold`
++ sorted `roster` — so it vouches for *which keys are eligible and how many must
+sign*, but for **nothing** about either approver's `reason` or `decided_at`. Each
+approver signature covers the base plus only its own record. The verifier re-derives
+**L1** because 2 distinct roster keys (`aa1…`, `bb2…`) each signed; only 1 would
+fail `ThresholdNotMet:have=1,need=2`.

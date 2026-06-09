@@ -35,7 +35,7 @@ The crypto is a single Rust core compiled three ways — a Python wheel
 server or in a reviewer's browser. Nobody re-implements canonicalization, BLAKE3,
 or Ed25519 in JS or Python.
 
-**The one rule that governs every design choice:** a receipt proves an action was
+**The rule behind every design choice:** a receipt proves an action was
 _authorized_ under a known policy — and at L1 that a human _approved_ it with a
 device-held key. It does **not** prove the action _succeeded_ in the world. Never
 write code, copy, or comments that claim more. Never synthesize governance
@@ -74,13 +74,32 @@ One core, four surfaces. Choose by the job, not the language.
   (the action detail, the policy outcome + plain-English `rule_display`, the
   claimed `trust_level`, the BLAKE3 `action_hash`) plus an Ed25519 `signatures`
   array. Full schema: [references/receipts.md](references/receipts.md).
-- **Trust level** — `L0` = operator-signed. `L1` = operator **plus** a human
-  approver's co-signature from a device-held key. There is no L2/L3. Trust is
+- **Trust level** — `L0` = operator-signed. `L1` = operator **plus** at least one
+  human approver's co-signature from a device-held key. There is no L2/L3. Trust is
   **re-derived on every verify** from the signatures that pass; a receipt
   claiming L1 with only an operator signature fails `TrustLevelMismatch`. **Never
   read `trust_level` off the wire — gate on a verified one.**
+- **L1 has two shapes — both re-derive to L1, neither is higher.**
+  - **Single-approver L1** — one human co-signs the *same* bytes the operator
+    signed (the approver record is already embedded), so the operator vouches for
+    the **whole** record, the approval included. Carried in `content.approver_decision`.
+  - **Quorum L1 (k-of-n)** — e.g. 2-of-3. The operator signs an *emptied-approvers
+    base* (just the action, the `threshold`, and the sorted `roster`); each approver
+    separately signs only their own leg. Carried in a `content.multi_approval` block —
+    that block (never the level) is how you tell quorum apart from single-approver L1.
+    It is **not** a higher level and it is honestly **narrower** per approver: the
+    operator vouches for the action + threshold + which keys are eligible, and for
+    **nothing** about any individual approval's `reason` or `decided_at`. Do **not**
+    frame quorum as "more assurance because more people signed."
 - **Audit chain** — receipts BLAKE3 hash-linked; altering an earlier receipt
   breaks every link after it.
+- **Trusted time** — **anchorless by default**: most receipts carry no trusted
+  time and `verify` reports none. `content.captured_at` is the operator's own clock,
+  **informational only** — never authoritative. An optional `content.time_anchor`
+  (RFC-3161 TSA token) binds *when the assembled, post-approval body existed*
+  (existed-no-later-than), **not** the instant a human decided — and an approver's
+  `decided_at` is approver-claimed, never TSA-certified. When a policy marks time
+  Required, an unanchored receipt fails the verifier with `AnchorRequired`.
 
 ## Gate an agent (Python)
 
@@ -121,6 +140,17 @@ Non-negotiables:
 - **`require_approval` raises `SuspendedError`.** The action pauses and an
   approval opens; the work resumes at L1 once a human co-signs. See the
   suspend/resume API in [references/python.md](references/python.md).
+- **Console approvals (how the co-sign actually happens).** A trusted, role-gated
+  human approves the gated action in the web console and co-signs it **in the
+  browser** with a per-device WebCrypto key. The thin cloud relays the detached
+  co-signature and **holds no signing key**; the operator SDK re-mints the L1,
+  locally re-verifies it (`Valid(L1)`), and pushes it. The **same** relay flow
+  drives a k-of-n quorum — each approver co-signs their own leg in their own browser.
+- **Key rotation fails closed.** If the operator key rotates between suspend and
+  finalize, the in-core assemble rejects the stale base (an `OperatorKeyMismatch`)
+  and the SDK **re-suspends** the action under the new key — a fresh suspended L0
+  with a new `action_hash` that the approval re-opens against. Never a silent mint
+  under a stale key.
 - **Gate a whole client with `heso.wrap()`** — gates `.create()` as `llm_call`,
   `.request()` as `http_request`, reaches nested attrs
   (`client.chat.completions.create(...)`), passes the rest through.
@@ -225,18 +255,24 @@ Full detail + the "never write your own canonicalizer" rule:
 3. **Hash recomputes** (BLAKE3 over RFC-8785 canonical bytes, `action_hash`
    stripped first) → else `HashMismatch`
 4. **Operator signature verifies** → else `InvalidSignature` (or `Malformed`)
-5. **Approver signature verifies** (if present) → else `InvalidSignature`; the
+5. **Approver signature(s) verify** (if present) → else `InvalidSignature`; the
    approver key must differ from the operator → else `SelfApproval`. (There is no
-   `invalid_approver` verdict.)
+   `invalid_approver` verdict.) For a quorum (`multi_approval`) receipt each leg
+   verifies under the co-sign domain against a **distinct roster key**, and trust
+   re-derives to L1 only when **≥ `threshold`** distinct legs verify — fewer than
+   that fails `ThresholdNotMet` (carries `have`/`need`, e.g. `ThresholdNotMet:have=1,need=2`).
 6. **Redaction markers well-formed** → else `MalformedRedaction`
-7. **Trust re-derives** and matches the claim → else `TrustLevelMismatch`
+7. **Trust re-derives** and matches the claim → else `TrustLevelMismatch`. A quorum
+   re-derives to **L1** (with its `multi_approval` block), not a higher level.
 
-Three more gates run only when the field they check is present: a trusted-time
-`time_anchor` → `TimeAnchorUnverifiable`; a payment mandate → `MandateRejected`;
-and (re-deriving verify only) the signed classification → `ClassificationMismatch`
-/ `TaxonomyUnavailable`. A `Valid` verdict means exactly two things: the bytes are
-the bytes the operator signed (unaltered), and the re-derived trust level matches
-the claim. Nothing about downstream success.
+A few more gates run only when the field they check is present: a trusted-time
+`time_anchor` that does not verify → `TimeAnchorUnverifiable`; a receipt whose
+signed `anchor_policy = Required` carries **no** anchor → `AnchorRequired` (the
+offline verifier itself rejects it — not just the server); a payment mandate →
+`MandateRejected`; and (re-deriving verify only) the signed classification →
+`ClassificationMismatch` / `TaxonomyUnavailable`. A `Valid` verdict means exactly
+two things: the bytes are the bytes the operator signed (unaltered), and the
+re-derived trust level matches the claim. Nothing about downstream success.
 
 ## Honesty rules (do not violate)
 

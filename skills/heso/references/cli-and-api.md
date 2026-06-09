@@ -43,13 +43,27 @@ Get the API key from the dashboard (Settings / Billing).
 | --- | --- | --- | --- |
 | GET | `/v1/policy/pull` | — | `{ status, policy_id, policy_hash, toml }` |
 | POST | `/v1/receipts` | `{ receipt, supersedes_action_hash? }` | `{ status, entry_hash, seq }` |
-| GET | `/v1/approvals/{action_hash}` | — | `ApprovalView` |
-| GET | `/v1/approvals/{action_hash}/l1-parts` | — | `L1Parts` |
+| GET | `/v1/approvals/{action_hash}` | — | `ApprovalView` (carries `threshold` + `approved_count`) |
+| GET | `/v1/approvals/{action_hash}/assembly` | — | the relayed co-sign legs |
 | POST | `/v1/approvals/{action_hash}/submit-token` | `SubmitTokenRequest` | `ApprovalView` |
 
 `status` on a receipt push is `appended` / `duplicate` / `quota_exceeded`. There
 is no batch route — `pushReceipts` loops over `POST /v1/receipts`. An approval is
 opened by mirror-pushing the suspended receipt (not a separate open call).
+
+**One unified assembly surface drives both single-approver and quorum.** `GET
+/v1/approvals/{action_hash}/assembly` returns a `legs` list (there is **no** separate
+`/l1-parts` route): `getL1Parts` reads `legs[0]`, `getQuorumParts` reads the whole
+list. Each `submit-token` call records **one** approver's vote, so a k-of-n quorum is
+`threshold` separate submit-token calls — each approver co-signs their own leg **in
+their browser** with a per-device key; the cloud relays the detached co-signatures
+(it holds no signing key). The operator SDK then re-mints the L1 (a quorum carries a
+`multi_approval` block but is **still L1**, not a higher level) and re-verifies it
+before push.
+
+If a policy marks trusted time **Required** for the lane, the pushed receipt must
+carry a verifiable RFC-3161 `time_anchor` — an unanchored one fails re-verification
+(`AnchorRequired`, a 422), exactly as the offline verifier would reject it.
 
 The server **re-verifies** every receipt through the same Rust core before
 accepting it — a tampered or under-signed receipt is rejected at the control plane,
@@ -84,6 +98,6 @@ Used by the Python SDK (`heso.init()` resolves explicit args → env → `heso.t
 | `HESO_BIN` | Legacy/compat — accepted but not needed (gating is in-process). |
 
 **Needs the API key:** `pullPolicy`, `pushReceipt(s)`, `pollApproval`,
-`waitForApproval`, `getL1Parts`, `submitApprovalToken`.
+`waitForApproval`, `getL1Parts`, `getQuorumParts`, `submitApprovalToken`.
 **Needs nothing (local, offline):** `gate`, `assertGate`, all signing, hashing,
 redaction, and the browser WASM verify.

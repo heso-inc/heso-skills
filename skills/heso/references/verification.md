@@ -29,8 +29,9 @@ result["kind"]   # "Valid" | "HashMismatch" | ...
 The verifier walks these top to bottom and stops at the **first** failure,
 reporting one verdict. It does not collect every problem — it names the earliest
 defect, so two verifiers given the same receipt agree on the same single answer.
-The seven core gates run on every receipt; gates 8–10 run only when the receipt
-carries the field they check. Passing yields `Valid`.
+The seven core gates run on every receipt; gates 8–11 run only when the signed
+field that triggers them is set (gate 9 fires when `anchor_policy = Required` and no
+anchor is present). Passing yields `Valid`.
 
 | # | Gate | Checks | Fail verdict |
 | --- | --- | --- | --- |
@@ -38,24 +39,41 @@ carries the field they check. Passing yields `Valid`.
 | 2 | Version recognized | `action_version == "heso-action/2.0"` | `Unsupported` |
 | 3 | Hash recomputes | BLAKE3 of canonical bytes == embedded `action_hash` | `HashMismatch` |
 | 4 | Operator signature verifies | Ed25519 under `key_id:"operator"` vs operator key | `InvalidSignature` / `Malformed` |
-| 5 | Approver signature verifies | If present (L1), Ed25519 vs approver key, AND approver ≠ operator | `InvalidSignature` / `SelfApproval` |
+| 5 | Approver signature(s) verify | Single-approver: Ed25519 vs approver key, AND approver ≠ operator. Quorum (`multi_approval`): every leg verifies under the co-sign domain against a **distinct roster key** | `InvalidSignature` / `SelfApproval` / `Malformed` |
 | 6 | Redaction markers well-formed | Markers structurally valid for their mode | `MalformedRedaction` |
-| 7 | Trust re-derives | Level derived from passing signatures == claimed `trust_level` | `TrustLevelMismatch` |
+| 7 | Trust re-derives | Level derived from passing signatures == claimed `trust_level`. Quorum re-derives to **L1** only when **≥ `threshold`** distinct legs verify | `TrustLevelMismatch` / `ThresholdNotMet` |
 | 8 | Trusted-time anchor (if present) | RFC-3161 anchor verifies vs a pinned TSA root | `TimeAnchorUnverifiable` |
-| 9 | Payment mandate (if present) | A `payment`'s mandate binding is not invalid/absent | `MandateRejected` |
-| 10 | Classification (re-deriving verify only) | Signed ERT replays from its facts | `ClassificationMismatch` / `TaxonomyUnavailable` |
+| 9 | Trusted-time required | Signed `anchor_policy = Required` but **no** `time_anchor` present | `AnchorRequired` |
+| 10 | Payment mandate (if present) | A `payment`'s mandate binding is not invalid/absent | `MandateRejected` |
+| 11 | Classification (re-deriving verify only) | Signed ERT replays from its facts | `ClassificationMismatch` / `TaxonomyUnavailable` |
 
 Because trust is the **last core** gate and is re-derived rather than read, a
 receipt can never claim more than its signatures support. A receipt with both a
 tampered field and a bad signature reports `HashMismatch` (gate 3 comes first).
+
+**Quorum re-derivation (gates 5 + 7).** When the receipt carries a `multi_approval`
+block, the operator signature is checked over the *emptied-approvers base* (action +
+`threshold` + sorted `roster`), and each approver leg is verified separately under
+the co-sign domain. A leg must be a **distinct roster key** — a re-used key or a
+non-roster key fails. Trust re-derives to **L1** (with the `multi_approval` block,
+never a higher level) only when **≥ `threshold`** distinct legs verify; fewer fails
+`ThresholdNotMet` (which carries the counts, e.g. `ThresholdNotMet:have=1,need=2`).
+
+**`AnchorRequired` (gate 9).** Separate from `TimeAnchorUnverifiable` (a *present*
+anchor that fails to verify): if the receipt's signed `anchor_policy` is `Required`
+and it carries **no** `time_anchor`, the **offline verifier itself** rejects it with
+`AnchorRequired` — the requirement is enforced at verify, not only at the server.
+The anchorless-by-default posture (`anchor_policy` unset) is unaffected.
 
 ## Verdict strings
 
 All SDK surfaces return the **PascalCase engine tag**: `Valid`,
 `WrongAlgorithm:…`, `Unsupported:…`, `HashMismatch`, `InvalidSignature:…`,
 `MalformedRedaction:…`, `TrustLevelMismatch:…`, `Malformed:…`, `SelfApproval`,
-`TimeAnchorUnverifiable:…`, `MandateRejected:…`, `ClassificationMismatch:…`,
-`TaxonomyUnavailable:…`. Node (`verify`) and the browser WASM
+`ThresholdNotMet:…`, `TimeAnchorUnverifiable:…`, `AnchorRequired`,
+`MandateRejected:…`, `ClassificationMismatch:…`, `TaxonomyUnavailable:…`
+(`AnchorRequired` carries no detail; `ThresholdNotMet` carries `have`/`need`).
+Node (`verify`) and the browser WASM
 (`verifyActionReceipt`) put it on `result.verdict`; `@hesohq/sdk`'s `gate()`
 returns it verbatim on `GateResult.verdict`; the Python wheel returns it as the
 `kind` of a `{ kind, detail, trust_level }` dict. There is **no**
@@ -94,7 +112,20 @@ log:
 - `verifyInclusion` / `verifyConsistency` — RFC-6962 Merkle proofs (SHA-256) that
   a receipt is in the transparency log and that the log only ever appended.
 
-## What a `valid` verdict means
+Separate from chain-level rotation: at **finalize** time, if the operator key
+rotated between suspend and finalize, the in-core assemble fails closed (an
+`OperatorKeyMismatch`) rather than mint under a stale key. The SDK re-suspends the
+action under the new key (a fresh suspended L0 with a new `action_hash`) and the
+approval re-opens against it. The stale human co-sign cannot be replayed against the
+new base.
+
+`verifyWithTime(bytes)` returns the receipt verdict **plus** a trusted-time status:
+`"NoTrustedTime"` when anchorless (the default), or `"AnchoredRfc3161:<gen_time>"`
+when a verifiable anchor is present. Read `gen_time` as an existed-no-later-than
+bound on the assembled (post-approval) body — **not** when a human decided. A
+*present* anchor that fails to verify sinks the whole receipt (`TimeAnchorUnverifiable`).
+
+## What a `Valid` verdict means
 
 Exactly two things, both re-derived from the artifact: (1) the bytes are the bytes
 the operator signed, unaltered; (2) the re-derived trust level matches the claim —
@@ -103,3 +134,12 @@ approved it with their own device-held key. It records **what was authorized, no
 the downstream outcome**. A valid receipt for a tool call proves the operator
 authorized that call — separate from whether the tool returned correct data or a
 payment settled.
+
+For a **quorum** (`multi_approval`) L1, `Valid` means narrower per approver: ≥
+`threshold` distinct roster keys each co-signed their **own** leg, and the operator
+authorized the action under that threshold + roster. It does **not** mean the
+operator (or the group) vouches for any single approver's stated `reason` or
+`decided_at` — the operator signed an emptied-approvers base and never signed over
+those. Read a quorum as "the operator authorized this under this threshold/roster,
+and k distinct approvers each signed", not as a group attestation of any one
+approver's reasoning.
