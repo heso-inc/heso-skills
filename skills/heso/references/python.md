@@ -16,8 +16,19 @@ heso init
 
 `heso init` mints the operator identity, writes a starter `heso.toml`, and
 gitignores the local data dir. Idempotent. Leaves `heso_bootstrap.py`,
-`heso.toml`, and `.heso/` (key + JSONL audit chain + outbox). Commit `heso.toml`,
-never `.heso/`.
+`heso.toml`, and `heso-local-data/` (key + `receipts.jsonl` + audit chain +
+outbox). Commit `heso.toml`, never `heso-local-data/`. When `HESO_KEY_PASSPHRASE`
+is unset, `heso init` auto-writes a dev-only passphrase
+(`heso-local-data/DEV-ONLY.passphrase`, 0600) and `heso.init()` loads it back into
+the env so the lifecycle works with zero setup; `HESO_ENV=production` (or
+`--require-passphrase`) refuses and demands a real passphrase. The other CLI
+commands — `heso demo`, `heso verify <path|hash>`, `heso show <hash>` — read the
+local store; see [cli-and-api.md](cli-and-api.md).
+
+**Every allowed action's signed receipt is appended to
+`heso-local-data/receipts.jsonl`** (one receipt per line, the exact shape
+`heso-verify-cli` and the evidence bundle consume) — so your first receipt is a
+file you can verify offline, not a dict that dies with the process.
 
 ## init
 
@@ -153,7 +164,7 @@ a manually-built `Action`.
 | Exception | Raised when |
 | --- | --- |
 | `BlockedError` | Policy blocked the action (and `blocking=True`). |
-| `SuspendedError` | Policy routed the action to a human; it's paused for approval. |
+| `SuspendedError` | Policy routed the action to a human; it's paused for approval. Carries `action_hash` + `rule_id`; its message is **actionable** — prints the console approvals URL when configured, else the local `@heso.gated` + `append_decision` dev path. |
 | `BridgeError` | The Rust engine bridge failed. |
 | `HesoConfigError` | Bad/missing configuration. |
 

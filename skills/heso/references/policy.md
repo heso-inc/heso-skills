@@ -96,6 +96,24 @@ composer (`composeConditionDisplay`) so the live sentence stays honest.
   returns a `policy_id`. Only **Security Admin** and **Owner** roles hold the
   `deploy_policy` permission.
 
+## Curated policy packs
+
+HESO ships curated **policy packs** — bundles of tighten-only `require_approval`
+rules mapped to a framework's controls. They are a starting point, not a separate
+engine: a pack **merges into the active policy via deploy** and is enforced by the
+same first-match-wins floors-and-all engine. Because every pack rule is
+tighten-only, a pack can never trip the `[FLOOR_BYPASS]` validator.
+
+Current packs (`specs/packs/*.toml` + `manifest.toml`): `AI Agent Baseline` (the
+single free **starter** pack), `SOC 2`, `ISO/IEC 27001`, `HIPAA`, and — authored
+but **draft / unpublished** (`is_published = false`, hidden from the gallery until
+the control set is reviewed) — `ISO/IEC 42001` and `NIST AI RMF`. Each pack carries
+a content hash (`pack_hash = blake3(rules_toml)`) that drives "update available",
+and a `min_plan`: `min_plan` gates **enforcing** a pack (free orgs get the starter
+pack; SOC 2 and beyond are Pro+), while **preview / simulate stay free** for
+everyone. Do not present ISO 42001 / NIST AI RMF as live, installable gallery
+packs — they exist in source but are unpublished.
+
 ## Pinned floors (always-on)
 
 `payment`, `delete`, `account_change`, and large `data_export` carry a built-in
@@ -132,8 +150,8 @@ decided.
 The dashboard compiles rules to TOML and pulls them back (`rulesToToml` /
 `parseRulesFromToml`). `heso init` writes a starter `heso.toml`; the local Python
 engine discovers it by walking **upward** from the project root and reads it
-in-process. Commit the policy; the local data dir (`.heso/`) is gitignored. A
-single `[[rule]]` block:
+in-process. Commit the policy; the local data dir (`heso-local-data/`) is
+gitignored. A single `[[rule]]` block:
 
 ```toml
 [[rule]]

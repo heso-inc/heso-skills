@@ -100,6 +100,16 @@ When the cloud accepts a receipt at `POST /v1/receipts` it re-verifies through
 this same core before storing — the server is not a more-trusted verifier; it runs
 the identical gates you can run locally.
 
+**Anyone can verify without trusting (or installing) HESO.** The public `/verify`
+page on heso.ca checks a pasted/uploaded receipt entirely in the browser (the same
+wasm core), with **no login** — credential-less fixtures included. The wire format
+is openly specified — `ACTION-RECEIPT-1.0`, `ACTION-RECEIPT-2.0`, `TRANSPARENCY-1.0`,
+`HESO-1.0` — and an MIT/Apache-dual-licensed open repo ships the verifier crate and
+the standalone `heso-verify-cli`, so a third party can re-implement or run the check
+with zero HESO code. An **evidence bundle** packages `receipts.jsonl` + a `VERIFY.sh`
++ a `README.txt` (deterministic POSIX tar) so a relying party unpacks it and runs
+`./VERIFY.sh`, which resolves the released `heso-verify-cli` and verifies offline.
+
 ## Chains and transparency
 
 Beyond single receipts, the core verifies hash-linked chains and the transparency

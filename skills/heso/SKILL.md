@@ -12,7 +12,7 @@ description: >-
   this action", "require approval", "verify a receipt", "trust level", "policy
   rule", "heso.toml", "Action Receipt", "redact".
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   homepage: https://heso.ca/docs
   source: heso-inc/heso-web
 license: MIT
@@ -41,7 +41,7 @@ device-held key. It does **not** prove the action _succeeded_ in the world. Neve
 write code, copy, or comments that claim more. Never synthesize governance
 numbers (receipt/approval/block counts must be real or honestly empty).
 
-All packages are at `0.1.0`. Wire format: `alg = "heso-action/v2+ed25519"`,
+All packages are at `0.1.1`. Wire format: `alg = "heso-action/v2+ed25519"`,
 `action_version = "heso-action/2.0"`.
 
 ## Pick the package first
@@ -108,8 +108,16 @@ Scaffold once, decorate the actions, init before the agent runs. Full surface
 
 ```bash
 pip install heso        # or: uv add heso
-heso init               # mints operator key, writes starter heso.toml, gitignores .heso/
+heso init               # mints operator key, writes starter heso.toml, gitignores heso-local-data/
+heso demo               # mint + verify your first receipts offline (no cloud, no policy edits)
 ```
+
+`heso init` is zero-setup: when `HESO_KEY_PASSPHRASE` is unset it auto-generates a
+**dev-only** passphrase (`heso-local-data/DEV-ONLY.passphrase`, 0600) so the
+encrypted key unlocks with no env wrangling — `HESO_ENV=production` (or
+`--require-passphrase`) refuses to generate one and demands a real passphrase.
+The CLI is four commands: `init`, `demo`, `verify <path|hash>`, `show <hash>`.
+Full detail: [references/cli-and-api.md](references/cli-and-api.md).
 
 ```python
 import heso
@@ -138,7 +146,10 @@ Non-negotiables:
   the body runs. Pass `blocking=False` for observe-only (shadow) mode: refused
   actions are still captured, signed, and audited, but don't raise.
 - **`require_approval` raises `SuspendedError`.** The action pauses and an
-  approval opens; the work resumes at L1 once a human co-signs. See the
+  approval opens; the work resumes at L1 once a human co-signs. In Python the
+  error is **actionable** — it carries `action_hash` + `rule_id` and its message
+  prints the next step (the console approvals URL when one is configured, else
+  the local `@heso.gated` + `heso.append_decision` dev path). See the
   suspend/resume API in [references/python.md](references/python.md).
 - **Console approvals (how the co-sign actually happens).** A trusted, role-gated
   human approves the gated action in the web console and co-signs it **in the
@@ -146,6 +157,9 @@ Non-negotiables:
   co-signature and **holds no signing key**; the operator SDK re-mints the L1,
   locally re-verifies it (`Valid(L1)`), and pushes it. The **same** relay flow
   drives a k-of-n quorum — each approver co-signs their own leg in their own browser.
+  When a suspension opens, the org can notify approvers out of band (Resend email +
+  HMAC-signed org webhooks, configured manager-only on the **console session plane**
+  at `GET/PUT /v1/org/notifications` — not the SDK's x-api-key plane).
 - **Key rotation fails closed.** If the operator key rotates between suspend and
   finalize, the in-core assemble rejects the stale base (an `OperatorKeyMismatch`)
   and the SDK **re-suspends** the action under the new key — a fresh suspended L0
@@ -157,6 +171,32 @@ Non-negotiables:
 - **Adapters:** `heso.HesoCallbackHandler()` for LangChain/LangGraph; `heso.wrap()`
   for OpenAI/Anthropic; lazy namespaces `heso.crewai`, `heso.openai_agents`,
   `heso.claude_agent`, `heso.pydantic_ai`, `heso.langgraph`, `heso.mcp`.
+
+## Gate an MCP server with zero code — `heso-mcp`
+
+The fastest way to govern an agent you don't want to touch: point any MCP client
+(Claude Desktop, Cursor, VS Code) at the `heso-mcp` proxy instead of the real
+stdio server. It spawns the real server after `--`, forwards every message
+verbatim, and intercepts only `tools/call` — running each through the same gate
+as the decorators **before** it reaches the server.
+
+```bash
+heso-mcp --project-root ~/agent -- npx -y @some/mcp-server --its --own --flags
+```
+
+- **allowed** → the signed receipt is persisted under
+  `heso-local-data/receipts/<action_hash>.json` and the request is forwarded
+  untouched; the server's result is bound back as a follow-up receipt.
+- **blocked / suspended** → the request is **never** forwarded; the client gets a
+  proper MCP tool result with `isError: true` carrying the actionable reason (the
+  responsible rule for a block; the `action_hash` to approve for a suspension).
+- an engine fault **fails closed** — the call is refused, never forwarded ungated.
+- `--observe` is mirror-only (capture + sign, never refuse). With `--api-key` /
+  `--endpoint` a suspension also opens a hosted console approval. The dev
+  passphrase file is picked up automatically (and refused under `HESO_ENV=production`).
+
+Everything that isn't a `tools/call` (`initialize`, `tools/list`, notifications,
+server stderr) passes through byte-for-byte, so the proxy is invisible to both sides.
 
 ## Verify a receipt (TypeScript / Node)
 
@@ -197,6 +237,23 @@ Await `init()` exactly once. Also exposes in-browser policy tooling — `parsePo
 `policyRulesFromToml`, `ruleToSentence`, `validateNoFloorBypass` (parse / preview /
 floor-check; there is **no** decision-against-action `evaluatePolicy`).
 
+**Anyone can verify without HESO.** The public `/verify` page on heso.ca checks a
+pasted/uploaded receipt in the browser (same wasm core) with **no login** — point
+a relying party there. The wire format is openly specified (`ACTION-RECEIPT-1.0`,
+`ACTION-RECEIPT-2.0`, `TRANSPARENCY-1.0`, `HESO-1.0`) and an MIT/Apache-dual-licensed
+verifier crate + `heso-verify-cli` let third parties verify with zero HESO code.
+
+## Evidence bundles — offline, self-verifying
+
+Beyond a single receipt, the core assembles a **self-contained evidence bundle**: a
+directory (and a deterministic POSIX tar) holding the `receipts.jsonl`, a `VERIFY.sh`,
+and a `README.txt`. The relying party unpacks it and runs `./VERIFY.sh` — which
+resolves the released standalone `heso-verify-cli` and re-checks every receipt
+offline, with no HESO install and no network. The Rust entry point is
+`heso._core.evidence_bundle_tar` (consumed by the SDKs); on the cloud, Team+ orgs
+export a bundle via `POST /v1/evidence/export`. A bundle proves the same thing one
+receipt does — authorization, re-derived — never downstream success.
+
 ## Policy is authored in the dashboard, not hand-written
 
 This is the part people get wrong. **Policy is built in the HESO web console**
@@ -230,6 +287,15 @@ hold). Operators: `gt`, `lt`, `gte`, `lte`, `eq`, `neq`, `in`, `not_in`,
 working policy and shows which rule matches and the decision — before anything
 ships. Deploying goes through a **Review & sign** bar to the Rust engine
 (`deployPolicy` → a `policy_id`); only Security Admin / Owner can deploy.
+
+**Curated packs (a starting point, not a separate engine).** HESO ships curated
+policy packs (`AI Agent Baseline`, `SOC 2`, `ISO 27001`, `HIPAA`, and — currently
+**draft / unpublished** — `ISO/IEC 42001` and `NIST AI RMF`) that **merge into the
+active policy via deploy** — they are tighten-only `require_approval` rules, so they
+can never trip the floor validator. `min_plan` gates *enforcing* a pack (free orgs
+get one starter pack: `AI Agent Baseline`; SOC 2 / packs beyond it are Pro+);
+preview and simulate stay free for everyone. Don't describe ISO 42001 / NIST AI RMF
+as live gallery packs yet.
 
 Hard rules:
 
