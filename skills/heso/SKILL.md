@@ -41,9 +41,10 @@ device-held key. It does **not** prove the action _succeeded_ in the world. Neve
 write code, copy, or comments that claim more. Never synthesize governance
 numbers (receipt/approval/block counts must be real or honestly empty).
 
-All packages are at `0.4.0` on public npm and PyPI (`pip install heso`,
-`npm install @hesohq/sdk`). Wire format: `alg = "heso-action/v2+ed25519"`,
-`action_version = "heso-action/2.0"`.
+All packages ship together at one version on public npm and PyPI
+(`pip install heso`, `npm install @hesohq/sdk`) — check the registry for the
+current release rather than trusting a number written here. Wire format:
+`alg = "heso-action/v2+ed25519"`, `action_version = "heso-action/2.0"`.
 
 ## Pick the package first
 
