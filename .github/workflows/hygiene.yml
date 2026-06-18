@@ -1,0 +1,23 @@
+name: hygiene
+
+# heso-skills is markdown only — no code hygiene to capture, just the
+# tracked-junk gate so caches / .omc / OS noise can't creep into the repo.
+# Report-only (roadmap P0); flips blocking in P7.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tracked-junk:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - run: bash scripts/check-tracked-junk.sh
