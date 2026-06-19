@@ -3,8 +3,8 @@
 #
 # This gates .gitignore drift itself: junk like caches, .omc/, tfstate,
 # *.tsbuildinfo and empty/orphan dirs can never silently creep back into version
-# control. Report-only in P0 (CI runs it under continue-on-error to capture the
-# baseline); flips merge-blocking in P7.
+# control. This is a real merge-blocking gate (exit 1 on a tracked artifact);
+# CI runs it without continue-on-error, so red means "junk got committed".
 #
 # Part of the HESO P0 hygiene baseline (full spec lives in the redesign plan).
 set -uo pipefail
@@ -12,10 +12,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
 # Ignored-class path patterns that must never be tracked, anchored to path
-# segments so a legitimately-named file can't false-positive. NOTE: *.wasm is
-# intentionally NOT gated — untracking heso_wasm_bg.wasm is deferred to the P3
-# SDK build reshuffle: CI rebuilds the wasm before publish, but local dev and
-# node-publish's tsc step still rely on the tracked artifacts today.
+# segments so a legitimately-named file can't false-positive.
 patterns='(^|/)(__pycache__|\.ruff_cache|\.pytest_cache|\.mypy_cache|\.venv|node_modules|\.next|\.turbo|target|\.terraform|\.omc|\.conductor|\.cursor)/|\.(pyc|pyo|tsbuildinfo|tfstate)($|\.)|(^|/)\.DS_Store$'
 
 hits=$(git ls-files | grep -E "$patterns" || true)
