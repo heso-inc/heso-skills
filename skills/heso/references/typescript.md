@@ -1,22 +1,26 @@
 # TypeScript / Node reference (`@hesohq/sdk`)
 
-`@hesohq/sdk` (Node ≥ 18, CommonJS) does two jobs: it **gates and signs** an
-agent's actions in-process, and it **verifies** receipts and talks to the cloud
-control plane. Zero crypto in TS — it binds to the native `@hesohq/core` (verify)
-and `@hesohq/node` (mint), so a verdict here is byte-identical to a reviewer's
-browser. `@hesohq/core` ships prebuilt native binaries (darwin/linux/win) as
-optionalDependencies; minting needs `@hesohq/node` built with the `process`
-feature (loaded lazily, so verify-only deployments never need it).
+`@hesohq/sdk` (Node ≥ 18) does two jobs: it **gates and records** an agent's
+actions in-process, and it **verifies** receipts and talks to the cloud. Zero
+crypto in TS — it binds to the native `@hesohq/core` (verify) and `@hesohq/node`
+(mint), so a verdict here is byte-identical to a reviewer's browser. `@hesohq/core`
+ships prebuilt native binaries as optionalDependencies; minting needs
+`@hesohq/node` (loaded lazily, so verify-only deployments never need it).
 
 ```bash
 pnpm add @hesohq/sdk          # verify + cloud
 pnpm add @hesohq/node         # also gate/mint (optional; the native addon)
 ```
 
+There are **two capture surfaces** — the async **recorder** (off the hot path) and
+the fail-closed **gate** (the egress interceptor that blocks). The conceptual split
+and the two pillars (keys customer-side, redact-before-sign) live in
+[recorder-and-gate.md](recorder-and-gate.md); this page is the Node API.
+
 ## Gate an agent (Node)
 
-Call `init()` once, then gate tool calls — via a framework adapter or the
-`engine` capture core. The native addon mints; a blocked/suspended action throws.
+Call `init()` once, then gate tool calls — via a framework adapter or the `engine`
+capture core. The native addon mints; a blocked/suspended action throws.
 
 ```ts
 import { init, engine, SuspendedError } from "@hesohq/sdk"
@@ -30,38 +34,34 @@ const tools = { search: gateTool("search", tool({ inputSchema, execute })) }
 // ...or the engine core directly:
 const action = engine.gate("transfer_funds", { amountUsd: 4200 }, { verb: "payment" })
 const result = await transferFunds({ amountUsd: 4200 })
-engine.recordResult(action, result)         // bind result to a follow-up receipt
+engine.recordResult(action, result)         // bind result to a follow-up commitment
 ```
 
 - `init(options?)` — engine runtime config (projectRoot/workflow/account/
   clockOverride/blocking); resolves explicit → `HESO_*` env → discovery → default.
   `currentConfig()` reads it back.
-- `engine.gate(toolName, input, opts?)` — capture + drive + ENFORCE (throws
-  `BlockedError` / `SuspendedError`). `engine.evaluate(...)` — capture without
-  enforcing → `{ outcome, action }`. `engine.recordResult(action, output)`.
-- Adapters: `aiSdk.gateTool` / `aiSdk.gateTools`, `mastra.*` — thin wrappers over
-  the engine core (also at `@hesohq/sdk/adapters/*`).
+- `engine.gate(toolName, input, opts?)` — capture + classify-by-effect + ENFORCE
+  (throws `BlockedError` / `SuspendedError`). The gate classifies against the
+  [taxonomy](taxonomy.md) into a destructive primitive before signing.
+  `engine.evaluate(...)` captures without enforcing → `{ outcome, action }`.
+- Adapters: `aiSdk.gateTool` / `gateTools`, `mastra.*` — thin wrappers over the
+  engine core. (Python is the lead binding with more adapters; on Node the same one
+  Rust core does the work — see [python.md](python.md).)
 - **Two-phase approval:** `engine.gate` throws `SuspendedError(actionHash)`; out of
   band, `waitForApproval(actionHash)` → `finalizeL1(suspendedContent, parts)`
-  assembles + mirrors the L1. A rejected decision throws `ApprovalRejectedError`.
-- **Console co-sign (how the approval is produced).** The human approves in the web
-  console and co-signs **in their browser** with a per-device WebCrypto key; the
-  thin cloud relays the detached co-signature (it holds **no** key). `getL1Parts`
-  (or `waitForApproval`) returns that relayed record + co-signature, and `finalizeL1`
-  re-mints the L1 in-core and locally re-verifies `Valid(L1)` before pushing.
+  assembles the L1. A rejected decision throws `ApprovalRejectedError`.
 - **Quorum (k-of-n):** `getQuorumParts(actionHash)` returns all relayed legs;
   `finalizeQuorum(suspendedContent, parts, opts?)` assembles a quorum receipt that
-  re-derives to **L1 with a `multi_approval` block** — not a higher level, and
-  honestly narrower per approver (the operator signs only action + threshold +
-  roster). Under-quorum at verify is `ThresholdNotMet`.
-- **Key rotation fails closed.** If the operator key rotates between suspend and
-  finalize, the in-core assemble rejects it (`OperatorKeyMismatchError`). Pass
-  `finalizeQuorum`'s `loadedOperatorPubkeyB64` for the proactive check and
-  `onKeyRotation` to auto-recover: it re-suspends under the new key (a fresh
-  `action_hash` via `ReSuspendResult`) instead of minting under a stale one.
+  re-derives to **L1 with a `multi_approval` block**. Under-quorum at verify is
+  `ThresholdNotMet`. (Quorum semantics: [receipts.md](receipts.md).)
 
-The deepest capture surface is still the Python SDK (more adapters, suspend/
-resume); on Node the same one Rust core does the work.
+The co-sign / relay flow and the key-rotation fail-closed behavior are **one
+canonical statement** in [SKILL.md](../SKILL.md) — TS exposes them via `getL1Parts`
+/ `getQuorumParts` / `waitForApproval` (relayed parts), `finalizeL1` /
+`finalizeQuorum` (re-mint + local re-verify before push), and
+`finalizeQuorum(..., { loadedOperatorPubkeyB64, onKeyRotation })` (the proactive
+rotation check + auto-re-suspend under a new key, `OperatorKeyMismatchError` /
+`ReSuspendResult`).
 
 ## Local verification (no config, no network)
 
@@ -70,7 +70,7 @@ import { gate, assertGate, isDecisionAllowed, shortHash } from "@hesohq/sdk"
 
 const r = gate(receiptBytes, "L0")     // GateResult — verifies bytes locally
 r.allowed      // boolean — verifies AND meets the minimum trust level
-r.trustLevel   // "L0" | "L1" | null  (null when verification fails before a level)
+r.trustLevel   // "L0" | "L1" | null
 r.verdict      // engine tag: "Valid" | "HashMismatch" | "TrustLevelMismatch" | ...
 
 assertGate(receiptBytes, "L1")          // throws unless valid AND human co-signed
@@ -81,105 +81,103 @@ isDecisionAllowed(receipt, ["allow", "redact"])  // branch on policy, not crypto
 shortHash(hex, "rcpt")  // "rcpt:9f2c4e7a" — display helper
 ```
 
-- `gate(receiptBytes: Buffer | string, minTrust?: TrustLevel = "L0"): GateResult`
-- `assertGate(receiptBytes: Buffer | string, minTrust?: TrustLevel = "L0"): void`
-- `isDecisionAllowed(receipt: ActionReceipt, allowed: DecisionPath[]): boolean`
+- `gate(receiptBytes, minTrust = "L0"): GateResult`
+- `assertGate(receiptBytes, minTrust = "L0"): void`
+- `isDecisionAllowed(receipt, allowed: DecisionPath[]): boolean`
 
-`GateResult.verdict` is the PascalCase engine tag (`gate()` returns it verbatim
-from the native `verify`), NOT a snake_case string. Trust is re-derived on every
-verify — never read `trustLevel` off parsed JSON; get it from `gate()`.
+`GateResult.verdict` is the PascalCase engine tag, returned verbatim from the
+native `verify`. **Never read `trustLevel` off parsed JSON — get it from
+`gate()`** (re-derived on every verify; see the honesty rules in
+[SKILL.md](../SKILL.md)).
 
 ## Verify-on-response proxy — `wrap`
 
-`wrap` returns a Proxy around a client. After each method it looks for a
+`wrap` returns a Proxy around a client; after each method it looks for a
 `__heso_receipt` field on the result and VERIFIES it against `minTrust` (distinct
-from `engine.gate`, which captures + mints your own actions). Methods without
+from `engine.gate`, which captures + mints *your own* actions). Methods without
 `__heso_receipt` pass through unguarded.
 
 ```ts
-import { wrap, pushReceipt } from "@hesohq/sdk"
+import { wrap } from "@hesohq/sdk"
 
 const guarded = wrap(agentClient, {
   minTrust: "L1",
-  onReceipt: async (method, receiptJson) => { await pushReceipt(JSON.parse(receiptJson)) },
+  onReceipt: (method, receiptJson) => { /* hand off the verified receipt */ },
   onGateFail: (method, verdict) => { console.error(`${method}: ${verdict}`); return false },
 })
 ```
 
-`WrapOptions`: `minTrust?: TrustLevel`,
-`onReceipt?: (method, receiptJson) => void | Promise<void>`,
-`onGateFail?: (method, verdict) => boolean | Promise<boolean>` (return `true` to
-swallow the failure, `false` to throw).
+`WrapOptions`: `minTrust?: TrustLevel`, `onReceipt?: (method, receiptJson) => void
+| Promise<void>`, `onGateFail?: (method, verdict) => boolean | Promise<boolean>`
+(return `true` to swallow, `false` to throw).
 
-## Cloud client
+## Cloud client — transport + commitments
 
-`configure(apiKey: string, endpoint: string): void` once at startup, before any
-cloud call (separate from `init()`, which configures local minting). The org is
-resolved from the api-key — there is **no team id**; approvals are keyed by
-`action_hash`. Local `gate`/`assertGate` need no config.
+`configure(apiKey, endpoint): void` once at startup, before any cloud call
+(separate from `init()`, which configures local minting). The org is resolved from
+the api-key — there is **no team id**; approvals are keyed by `action_hash`. Local
+`gate`/`assertGate` need no config.
+
+> **The transport sends a commitment, not the receipt.** The open SDK depends on an
+> injected `@hesohq/transport` interface (not a hard import of the closed cloud
+> client), so open code never drags closed code. The transport pushes a
+> **commitment** — BLAKE3 fingerprint + queryable index (primitive, rail, chain
+> head, signatures) — and **raw content stays in the customer VPC.** This replaces
+> the retired `pushReceipt` firehose; the cloud verifies the detached signatures and
+> proves **inclusion**, it does **not** re-run a check over a full body. Full model:
+> [cloud.md](cloud.md).
 
 | Method | HTTP | Returns |
 | --- | --- | --- |
 | `pullPolicy()` | GET `/v1/policy/pull` | `{ status, policyId, policyHash, toml }` |
-| `pushReceipt(receipt, supersedesActionHash?)` | POST `/v1/receipts` | `ReceiptPushResult` |
-| `pushReceipts(receipts[])` | loops POST `/v1/receipts` | `ReceiptPushResult[]` |
+| `pushCommitment(commitment)` | POST `/v1/commitments` | `CommitmentPushResult` |
 | `pollApproval(actionHash)` | GET `/v1/approvals/{action_hash}` | `ApprovalView` |
 | `waitForApproval(actionHash, { pollIntervalMs?, timeoutMs? })` | polls (+ one assembly GET on approval) | `ResolvedApproval` or throws |
-| `getL1Parts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads `legs[0]`) | `L1Parts` (single-approver) |
-| `getQuorumParts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads all `legs`) | `QuorumParts` (all k legs) |
+| `getL1Parts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads `legs[0]`) | `L1Parts` |
+| `getQuorumParts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads all `legs`) | `QuorumParts` |
 | `submitApprovalToken(actionHash, input)` | POST `/v1/approvals/{action_hash}/submit-token` | `ApprovalView` |
 
-`waitForApproval` defaults: `pollIntervalMs = 2000`, `timeoutMs = 300000`. There
-is **no batch route** — `pushReceipts` loops. `submitApprovalToken`'s `input` is a
-`SubmitTokenInput` (`{ tokenB64, actionContent, requiredScope?, decision?, ... }`),
-not a bare token string.
+`waitForApproval` defaults: `pollIntervalMs = 2000`, `timeoutMs = 300000`.
+`submitApprovalToken`'s `input` is a `SubmitTokenInput`, not a bare token string.
 
 ```ts
-const result = await pushReceipt(JSON.parse(receiptJson))
+const result = await pushCommitment(commitment)
 result.status     // "appended" | "duplicate" | "quota_exceeded"
-result.entryHash  // echoes the receipt's action_hash
-result.seq        // the mirror's per-org append position
+result.entryHash  // echoes the commitment's action_hash
+result.seq        // the ledger's per-org append position
 ```
 
-`ReceiptPushResult`: `{ status: "appended" | "duplicate" | "quota_exceeded",
-entryHash: string, seq: number }`. The server **re-verifies** every receipt before
-mirroring — a tampered body is rejected at the control plane, not just locally.
-
-Client-approval (delegation): `signDelegation` / `mintDelegationEnvelope` mint an
-operator delegation envelope so a customer co-signs from their own browser.
+The store is append-only — a re-pushed commitment is `duplicate` (HTTP 409), never
+an overwrite. Client-approval delegation (`signDelegation` /
+`mintDelegationEnvelope`) mints an operator delegation envelope so a customer
+co-signs from their own browser.
 
 ## Exported types
 
 `ActionReceipt`, `ActionContent`, `ActionDetail`, `PolicyOutcome`,
-`SignatureEntry`, `PolicyRule`, `Approval`, `GateResult`, `ReceiptPushResult`,
-`ApprovalView`, `L1Parts`, `QuorumParts`, `Outcome`, `Action`, `TrustLevel` (`"L0" | "L1"`),
-`Verb`, `DecisionPath` (`"allow" | "block" | "redact" | "require_approval"`),
-`ConditionOp` (the receipt subset).
+`SignatureEntry`, `PolicyRule`, `Approval`, `GateResult`, `CommitmentPushResult`,
+`ApprovalView`, `L1Parts`, `QuorumParts`, `Outcome`, `Action`, `TrustLevel`
+(`"L0" | "L1"`), `Verb`, `Primitive`, `DecisionPath` (`"allow" | "block" |
+"redact" | "require_approval"`), `ConditionOp`. Wire types are **generated from
+the kernel** (ts-rs), not hand-mirrored — the kernel is the one source of truth.
 
 ## Raw primitives — `@hesohq/core`
 
-When you need the primitives directly (`@hesohq/core` re-exports the native
-`@hesohq/node`):
+When you need primitives directly (`@hesohq/core` re-exports native `@hesohq/node`):
 
-- `verify(bytes): { verdict, trustLevel }`, `verifyWithTime(bytes)` (adds a
-  `timeStatus`: `"NoTrustedTime"` when anchorless — the default — or
-  `"AnchoredRfc3161:<gen_time>"`; `gen_time` bounds when the **post-approval body**
-  existed, not when a human decided; a present-but-bad anchor fails the receipt),
-  `verifyRederiving(bytes)` (replays the signed classification).
+- `verify(bytes)`, `verifyWithTime(bytes)` (adds a `timeStatus`: `"NoTrustedTime"`
+  when anchorless — the default — or `"AnchoredRfc3161:<gen_time>"`; `gen_time`
+  bounds when the **post-approval body** existed, not when a human decided),
+  `verifyRederiving(bytes)` (replays the signed classification →
+  `ClassificationMismatch`).
 - Hashing/canonicalization: `contentHash`, `anchoredContentHashJs`,
   `actionCanonicalBytesJs`, `chainHashHex`, `shortHash`, `blake3Hex`.
 - Chains: `verifyChain`, `verifySessionChainJs`,
   `verifySessionChainWithRotationJs`, `verifyAuditChain`.
-- Transparency (RFC-6962 Merkle): `verifyInclusionJs`, `verifyConsistencyJs`.
+- **Transparency / proof:** `verifyInclusionJs`, `verifyConsistencyJs` (the proof
+  primitives the cloud's proof surface is built on — [cloud.md](cloud.md)).
 - Approval / delegation: `verifyApprovalToken`, `verifyDelegation`.
 - Redaction: `redactDestructiveJs`, `redactCommitJs`.
-- Keys (Ed25519): `keyFromSeed(seed)`, `generateKey()`, `OperatorKey`.
+- Keys (Ed25519): `keyFromSeed`, `generateKey`, `OperatorKey`.
 - Minting (process feature): `processAction`, `assembleL1FromParts`,
-  `assembleQuorumFromParts` (the k-of-n sibling — both re-mint to L1).
-
-## Honesty boundary
-
-A receipt proves the operator authorized the action under a known policy, and at
-L1 that a person approved it with a device-held key. It records what was
-authorized, **not** whether the action succeeded downstream. The cloud holds no
-signing key; it only re-checks signatures already on the receipt.
+  `assembleQuorumFromParts` (both re-mint to L1).

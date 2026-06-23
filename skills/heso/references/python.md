@@ -1,11 +1,16 @@
 # Python gating reference (`heso`)
 
-The `heso` package (Python ≥ 3.10) is the only HESO surface that **captures and
-signs** an agent's actions. It runs in-process — the Rust core ships as the
-`heso._core` wheel, so there is no subprocess for gate operations. Capture, policy
-evaluation, signing, and the audit chain all happen inside your process.
-Auto-instrumentation was removed; supported gating is the decorators, `wrap()`,
-and the framework adapters.
+The `heso` package (Python ≥ 3.10) is the **lead binding** — the deepest capture
+surface (most adapters, suspend/resume). It runs in-process — the Rust core ships
+as the `heso._core` wheel, so there is no subprocess for gate operations. Capture,
+classify-by-effect, signing, and the audit chain all happen inside your process.
+
+HESO has **two capture surfaces** — the async **recorder** (off the hot path, an
+OTel GenAI consumer) and the fail-closed **gate** (the egress interceptor that
+blocks). The conceptual split and the two pillars (keys customer-side,
+redact-before-sign) are in [recorder-and-gate.md](recorder-and-gate.md); this page
+is the Python API. The decorators, `wrap()`, and the framework adapters are the
+supported surface (auto-instrumentation was removed).
 
 ## Scaffold
 
@@ -80,9 +85,9 @@ def call_partner_api(api_key: str, endpoint: str) -> dict:
 
 **Blocking** is the default (`blocking=True`, set on `heso.init`, not per-decorator):
 a blocked action raises `BlockedError` *before* the body runs. `blocking=False` is
-shadow mode — useful to
-roll HESO out and collect receipts (including for what *would* be blocked) without
-changing behavior, then flip to blocking once the policy looks right.
+shadow mode — useful to roll HESO out and collect receipts (including for what
+*would* be blocked) without changing behavior, then flip to blocking once the
+policy looks right.
 
 The call's arguments become the action's `fields`, so policy conditions match them.
 
@@ -132,29 +137,22 @@ reaches **L1** and the work can resume. The lower-level suspend/resume API:
 - Outcome/marker types: `Gate`, `ResumeOutcome`, `SUSPENDED`, `DENIED`, `Paused`,
   `ContextLost`.
 
-**How the co-sign actually happens (console + relay).** A trusted, role-gated human
-approves in the web console and co-signs the action **in their browser** with a
-per-device key; the thin cloud relays the detached co-signature and **holds no
-signing key**. The operator side fetches the relayed parts and re-mints + locally
-re-verifies the L1 before pushing:
+The co-sign / relay flow and the key-rotation fail-closed behavior are **one
+canonical statement** in [SKILL.md](../SKILL.md); quorum semantics are in
+[receipts.md](receipts.md). The Python API onto them:
 
 - `heso.cloud.get_l1_parts(action_hash)` → `L1Parts`, then
   `heso.finalize_l1(action_hash, suspended_content, parts)` assembles the
   single-approver L1 and pushes it.
 - `heso.cloud.get_quorum_parts(action_hash)` → `QuorumParts`, then
   `heso.finalize_quorum(action_hash, suspended_content, parts)` assembles a **k-of-n
-  quorum** receipt. A quorum re-derives to **L1 with a `multi_approval` block** — not
-  a higher level, and honestly narrower per approver (the operator signs only the
-  action + threshold + roster). Under-quorum at verify is `ThresholdNotMet`.
+  quorum** (re-derives to **L1** with a `multi_approval` block; under-quorum at
+  verify is `ThresholdNotMet`). `finalize_quorum` takes `loaded_operator_pubkey_b64`
+  (the proactive rotation check) and an `on_key_rotation` callback that re-suspends
+  under the new key (a fresh suspended L0 with a new `action_hash`,
+  `OperatorKeyMismatchError` on a stale base).
 - A non-approved record makes either finalize raise before touching the keystore;
   every leg of a quorum must be `approved`.
-
-**Key rotation fails closed.** If the operator key rotates between suspend and
-finalize, the in-core assemble rejects the stale base (`OperatorKeyMismatchError`).
-`finalize_quorum` takes `loaded_operator_pubkey_b64` (proactive check) and an
-`on_key_rotation` callback that re-suspends under the new key — a fresh suspended L0
-with a new `action_hash` the approval re-opens against. Never a silent mint under a
-stale key.
 
 `heso.process(action: Action) -> Outcome` runs the full pipeline imperatively for
 a manually-built `Action`.
@@ -201,6 +199,5 @@ Capture timing (`captured_at`) is the operator's own clock — **informational o
 An optional RFC-3161 `time_anchor` can bind when the (post-approval) receipt body
 existed; it is off by default, so most receipts carry no trusted time.
 
-A receipt proves the operator *authorized* the action under a known policy, and at
-L1 that one or more people *approved* it (single-approver, or a k-of-n quorum) with
-device-held keys. It does not prove the action *succeeded* downstream.
+A receipt proves **authorization** (and at L1 human approval), never a downstream
+outcome — see the honesty rules in [SKILL.md](../SKILL.md).

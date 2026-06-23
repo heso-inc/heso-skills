@@ -1,12 +1,13 @@
 name: hygiene
 
-# heso-skills is markdown only — no code hygiene to capture (no clippy/ruff/knip),
-# so there are no report-only findings jobs here. The one job is the tracked-junk
-# gate, kept as a REAL gate so caches / .omc / OS noise can't creep into the repo.
+# heso-skills ships markdown only — no clippy/ruff/knip — so its gates are the
+# cross-cutting tracked-junk gate plus the markdown-repo analogue of the LINT
+# gate: a SKILL.md structure check (frontmatter present · links resolve · no
+# orphan references). Both are REAL merge-blocking gates (no report-only jobs).
 #
-# Convention: a job is GREEN when its tools RAN; a job only goes RED when the work
-# is actually broken — for tracked-junk that means an ignored-class artifact got
-# committed. Red always means "actually broken", never "baseline noise".
+# Convention: a job only goes RED when the work is actually broken — tracked junk
+# got committed, or a SKILL.md lost its frontmatter / grew a dead link / orphaned
+# a reference. Red always means "actually broken", never "baseline noise".
 
 on:
   pull_request:
@@ -18,10 +19,18 @@ permissions:
   contents: read
 
 jobs:
-  # Real gate (not report-only): fails red if an ignored-class artifact is tracked.
+  # Real gate: fails red if an ignored-class artifact is tracked.
   tracked-junk:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
       - run: bash scripts/check-tracked-junk.sh
+
+  # Real gate (STYLE/LINT for a markdown repo): SKILL.md structure must hold.
+  skill-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - run: bash scripts/check-skill-structure.sh
