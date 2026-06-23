@@ -122,6 +122,53 @@ with heso.step(workflow="run-42"):
 Every action captured inside the block is scoped to that workflow, matchable by a
 `workflow` subject in policy.
 
+## Install the egress gate — `install_gate()` (the one-liner)
+
+The egress gate (`heso_gate`) has **one process-wide install**, not a per-client
+tax. `install_gate()` runs the no-standing-key assert **first** (fail-closed),
+auto-instruments the available clients (httpx / requests / urllib3 / aiohttp), and
+stores the process-global default credential floor:
+
+```python
+from heso_gate import install_gate
+
+install_gate()   # standing-key assert (fail-closed) → auto-instrument httpx/requests/urllib3/aiohttp
+```
+
+The credential floor mints **per kernel-classified destructive action** at the
+credential boundary — transport-independent, decoupled from which HTTP client got
+the in-process shim. Conceptual split + the tiered honesty (mediated vs un-mediated,
+asymmetric vs HMAC rails) is in [recorder-and-gate.md](recorder-and-gate.md).
+
+**Per-client shims are the fallback**, for a client `install_gate()` cannot reach:
+`HesoGateTransport` / `HesoGateAsyncTransport` on an `httpx.Client` / `AsyncClient`,
+and `HesoGateAdapter` mounted on a `requests.Session`'s `https://`.
+
+```python
+import httpx
+from heso_gate import HesoGateTransport
+client = httpx.Client(transport=HesoGateTransport(httpx.HTTPTransport()))  # fallback
+```
+
+### Self-check — escalates loudly
+
+`self_check()` returns a `SelfCheckReport`: `.gated` names the **mediated**
+(auto-instrumented) clients, `.uncoverable` names the transports the gate **cannot**
+see at all (raw `socket`, `subprocess`), and `.escalations` aggregates every
+un-mediated / uncoverable surface plus every reachable standing key. `.ok` is true
+only when `.escalations` is empty; `self_check(raise_on_gap=True)` raises
+`SelfCheckGapError`. The per-client `check_httpx_client(client)` /
+`check_requests_session(session)` cover the fallback shims.
+
+### Standing-key check — fails closed
+
+`install_gate()` runs `assert_no_standing_key()` first, **fail-closed by default**:
+a reachable broad standing rail key (`sk_live_*`, long-lived `AKIA*`, `ghp_*`,
+`xoxb-*`) raises `StandingKeyError` before any shim arms, because a standing key the
+floor cannot bound defeats the floor's guarantee. The detector reports only the
+env-var name, rail, redacted shape, and severity — **never the secret value**.
+Override deliberately with `install_gate(strict_standing_key=False)`.
+
 ## Approvals — suspend / resume
 
 When policy returns `require_approval`, a gated call raises **`SuspendedError`**
@@ -130,7 +177,10 @@ configured approvers; once a human co-signs with a device-held key the receipt
 reaches **L1** and the work can resume. The lower-level suspend/resume API:
 
 - `configure(...)`, `gated(callable)`, `gate(action)`, `gate_async(action)` —
-  gate an action and get a `Gate` result.
+  gate an action and get a `Gate` result. `@gated` is **named-approval sugar** — an
+  explicit "this function needs a human decision" annotation that routes a specific
+  function to a named approver regardless of its wire effect; it is not the egress
+  path (that is `install_gate()`).
 - `resume(action_hash)` → a `ResumeOutcome`; `decision(action_hash)` reads the
   current decision; `append_decision(action_hash, decision)` records one;
   `current_action_hash()` for the in-flight action.

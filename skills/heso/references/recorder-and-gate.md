@@ -7,7 +7,7 @@ semantics. Do not conflate them:
 | --- | --- | --- |
 | Hot path | **off it** — async, fire-and-forget | **on it** — the one thing that blocks |
 | Job | observe every agent step; fingerprint → sign → append off-thread | intercept the *egress* call, classify-by-effect, redact, sign the commitment, forward or fail closed |
-| Shape | an OpenTelemetry GenAI-semconv consumer (`BatchSpanProcessor` + pluggable exporter) | an HTTP-client shim *inside* the SDK (mitmproxy interception shape — no proxy, no MITM CA) |
+| Shape | an OpenTelemetry GenAI-semconv consumer on the OpenAI-Agents-SDK `TracingProcessor` pattern (custom batched processor + pluggable exporter) | an HTTP-client shim *inside* the SDK (mitmproxy interception shape — no proxy, no MITM CA) |
 | Failure mode | never crashes the agent (swallows, logs) | **fail-closed** — blocks the call if it can't classify/sign |
 
 The phrase **"gate-is-the-capture"** applies *only* to the gate: the egress
@@ -53,11 +53,20 @@ OpenAI SDK, Pydantic AI) feeds HESO for free. The input contract:
 > repo (old pages are redirect stubs). **Pin a semconv version** in the SDK and
 > gate against it in CI.
 
-**Architecture.** A custom `BatchSpanProcessor` (background-thread flush) → a
-pluggable exporter that does the kernel work (fingerprint → sign → append)
-off-thread. Registration (`add_trace_processor`-shape) hooks frameworks
-**without forking them** — the HESO recorder registers as an *extra* processor on
-the host's existing OTel provider.
+**Architecture.** A custom **batched processor** on the OpenAI-Agents-SDK
+`TracingProcessor` pattern (background-thread flush, *not* OTel's own
+`BatchSpanProcessor`) → a pluggable exporter that does the kernel work
+(fingerprint → sign → append) off-thread. `Recorder.record(span)` enqueues and
+**returns immediately** — it never blocks, signs, or relays on the agent's path.
+A full queue **drops the oldest span** (back-pressure, never block), and any
+exporter error is **swallowed and counted** (`RecorderStats.dropped` / `.errors`),
+so a slow or failing exporter can never stall or crash the agent. Anything that
+*must* be witnessed goes through the gate, not the recorder.
+
+Registration uses `add_trace_processor(Recorder())` — the OpenAI-Agents-SDK
+`add_trace_processor` shape, *additive* so it never steals the host's existing OTel
+export. This hooks frameworks **without forking them**: the HESO recorder registers
+as an *extra* processor alongside whatever the host already runs.
 
 **The framework adapters are recorder hooks.** The eight Python adapters
 (`langchain`, `langgraph`, `crewai`, `claude_agent`, `openai_agents`,
@@ -69,10 +78,10 @@ processor, don't fork the framework." For the lazy-namespace surface in code see
 ## GATE — egress interceptor, fail-closed
 
 The gate is the **synchronous** surface — the only thing that blocks. It learns
-mitmproxy's `request()` / `response()` interception shape and replicates it
-**inside the SDK's HTTP-client shim** — it does **not** ship mitmproxy (a
-TLS-intercepting proxy is operationally heavy and needs a MITM CA, which is hostile
-to customer-side key custody). The sequence on an outbound call:
+mitmproxy's `request()` interception shape and replicates it **inside the SDK's
+HTTP-client shim** — it does **not** ship mitmproxy (a TLS-intercepting proxy is
+operationally heavy and needs a MITM CA, which is hostile to customer-side key
+custody). The sequence on an outbound call:
 
 1. **Intercept** the outbound request before it leaves the process.
 2. **Classify-by-effect** via the kernel [taxonomy](taxonomy.md) → a destructive
@@ -88,6 +97,116 @@ to customer-side key custody). The sequence on an outbound call:
 **Policy at the gate.** Classification feeds the kernel policy engine (native
 first-match-wins) — this is where `default-deny` and the pinned floors bite. See
 [policy.md](policy.md).
+
+### Installing the gate — one global line on BOTH runtimes
+
+The shim is the same idea on both runtimes and the install is **one process-wide
+call** on each — not a per-client tax:
+
+- **JavaScript (`@hesohq/gate`)** — `installGate()` arms **every** egress transport
+  the SDK can reach (undici global dispatcher, `node:http`/`node:https`,
+  `globalThis.fetch`, `child_process`) and runs the no-standing-key assert last:
+
+  ```ts
+  import { installGate } from '@hesohq/gate'
+
+  installGate() // every reachable egress transport now gated, fail-closed; standing-key assert ran
+  ```
+
+  `undici` is an **optional peer dependency** loaded lazily — importing
+  `@hesohq/gate` in a non-undici runtime does not throw; `installGate()` does if
+  `undici` is missing. (The lower-level `hesoGate()` undici interceptor still
+  exists for a host that composes its own dispatcher.)
+
+- **Python (`heso_gate`)** — `install_gate()` is the matching one-liner: it
+  auto-instruments the available clients (httpx / requests / urllib3 / aiohttp)
+  process-wide and runs the no-standing-key assert first:
+
+  ```python
+  from heso_gate import install_gate
+
+  install_gate() # httpx/requests/urllib3/aiohttp auto-instrumented; standing-key assert ran first
+  ```
+
+  Per-client shims (`HesoGateTransport` / `HesoGateAsyncTransport` on an
+  `httpx.Client`, `HesoGateAdapter` mounted on a `requests.Session`) remain as a
+  **fallback** for a client `install_gate()` cannot reach — not the default path.
+
+**The floor minting is decoupled from the in-process shim.** The credential floor
+mints **per kernel-classified destructive action** at the credential boundary —
+transport-independent, not tied to whether a particular HTTP client got the
+in-process shim. Un-mediated transports the shim never saw are therefore
+**provably-flagged-after-the-fact on asymmetric rails only** (CloudTrail / PayPal,
+which third parties can verify offline); **HMAC rails** (Stripe / GitHub / Slack)
+degrade to **trust-the-rail** — there is no in-band proof for them, only the rail's
+own ledger. The self-check below names exactly which transports are mediated and
+which are not, so this gap is visible rather than hand-waved away.
+
+### Startup self-check (escalates loudly)
+
+Both SDKs ship a self-check that reports the **actual** install state per transport
+and **escalates** every un-armed transport and every reachable standing key. It does
+not return a quiet warnings array a host can ignore — an un-armed transport is
+reported as un-armed, full stop, and the throw-variant refuses to boot ungated.
+
+- **Python** — `self_check()` returns a `SelfCheckReport`. `.gated` names the
+  **mediated** (auto-instrumented) clients; `.uncoverable` names the transports the
+  gate **cannot** see at all (raw `socket`, `subprocess`); `.escalations` aggregates
+  every un-mediated/uncoverable surface plus every reachable standing key, and
+  `.ok` is true only when `.escalations` is empty. `self_check(raise_on_gap=True)`
+  raises `SelfCheckGapError`. The per-client `check_httpx_client(client)` /
+  `check_requests_session(session)` still exist for the fallback shims.
+- **JavaScript** — `selfCheck()` returns a `SelfCheckResult` with per-transport
+  booleans (`undiciGated`, `nodeHttpGated`, `fetchGated`, `childProcessGated`),
+  `uncoveredTransports` (the honest gap), `standingKeys`, and `escalations`. `ok`
+  is true only when every transport is armed and no FAIL-severity standing key is
+  reachable. `selfCheckOrThrow()` throws and lists the escalations — the startup
+  assert that refuses to boot ungated.
+
+### Startup standing-key check (fails closed)
+
+`install_gate()` / `installGate()` run a no-standing-key assert as part of install —
+**fail-closed by default.** If a broad standing rail key (`sk_live_*`,
+long-lived `AKIA*`, `ghp_*`, `xoxb-*`) is reachable in the environment, install
+**throws** (`StandingKeyError` / Python `StandingKeyError`) before any shim arms,
+because a standing key the floor cannot bound defeats the floor's whole guarantee.
+
+- The detector **never logs or returns the secret value** — only the env-var name,
+  the rail, a fixed marker-derived redacted shape (e.g. `sk_live_***`, never a byte
+  of the secret body), and the severity (`fail` / `warn`).
+- Override is **explicit and deliberate**: JS `installGate({ allowStandingKeys: true
+  | string[] })` or `HESO_ALLOW_STANDING_KEYS`; Python
+  `install_gate(strict_standing_key=False)`.
+
+### The fail-closed error taxonomy
+
+A thrown error of **any** kind is a fail-closed refusal — the wrapped call never fires.
+The SDK throws **typed** errors so a caller can branch on *why* it refused. The
+JavaScript surface (`@hesohq/gate`, every class `extends Error`) is the full set:
+
+- **`BlockedError`** — refused by policy. Carries `toolName`, `ruleId`, `reason`. The
+  normal "the rule said no" refusal.
+- **`SuspendedError`** — gated to a human and awaiting approval; thrown so it never fires.
+  Carries `toolName` and the `actionHash` the approver decides against.
+- **`ApprovalRejectedError`** — a human resolved the approval as anything other than
+  `approved` (`rejected` / `escalated`). Thrown by finalize **before** any assemble — a
+  non-approval **never** mints an L1. Carries `actionHash` and the resolved `decision`.
+- **`OperatorKeyMismatchError`** — the operator key loaded from the keystore does **not**
+  match the suspended body's `agent_identity` (the key rotated). The in-core assemble
+  fails closed rather than mint a receipt the verifier would reject; re-suspend under the
+  new key. Carries `actionHash`, `expectedAgentIdentity`, `loadedPublicKey`.
+
+**Python maps the same intent onto its own hierarchy** (it does not expose a named
+`ApprovalRejectedError` class):
+
+- `BlockedError` / `SuspendedError` live in `heso_engine` and subclass `RuntimeError`
+  (`BlockedError` carries `tool_name` / `rule_id` / `reason`; `SuspendedError` carries
+  `tool_name` / `action_hash` / `rule_id`).
+- `OperatorKeyMismatchError` and `NoTransportError` live in `heso_gate` and subclass
+  **`BridgeError`** — the distinct "the kernel itself failed / a relay primitive is
+  missing" fail-closed signal, separate from a normal policy `BlockedError`.
+- A rejected approval surfaces through the **`@gated` lifecycle**, not an exception: the
+  `Gate` handle reports `denied` (a terminal decision) — see [python.md](python.md).
 
 ### The rail-boundary hard floor beneath the soft gate
 
@@ -126,31 +245,26 @@ silently resumes on an expired session. The Slack approval card surfaces a live
 countdown for exactly this reason (see [embeds.md](embeds.md)); quorum (k-of-n) is
 harder under the wall because every co-signer must land inside one TTL window.
 
-## `heso-mcp` — gate-is-the-capture, concretely
+## MCP — the recorder observes; the egress gate enforces
 
-`heso-mcp` is the gate in its most concrete form: govern an agent you don't want
-to touch by pointing any MCP client (Claude Desktop, Cursor, VS Code) at the
-proxy instead of the real stdio server. It spawns the real server after `--`,
-forwards every message verbatim, and intercepts only `tools/call` — running each
-through the same gate **before** it reaches the server.
+MCP is split the same way the rest of the SDK is: the MCP **recorder** adapters
+*observe* `tools/call` traffic, and the **synchronous enforcement** for those calls
+rides the **egress gate**, not the MCP adapter. The recorder only watches and forwards.
 
-```bash
-heso-mcp --project-root ~/agent -- npx -y @some/mcp-server --its --own --flags
-```
+The recorder gives you two shapes (`heso_recorder.adapters.mcp` / `.mcp_proxy`):
 
-- **allowed** → the request is forwarded untouched; a signed commitment is
-  produced and the server's result binds back as a follow-up.
-- **blocked / suspended** → the request is **never forwarded**; the client gets a
-  proper MCP tool result with `isError: true` carrying the actionable reason (the
-  responsible rule for a block; the `action_hash` to approve for a suspension).
-- an engine fault **fails closed** — the call is refused, never forwarded ungated.
-- `--observe` is mirror-only (capture + sign, never refuse) — the per-deploy
-  **Shadow Mode** of the gate.
+- **In-process** — `wrap_call_tool(handler)` wraps an MCP `call_tool(name, arguments)`
+  handler so each `tools/call` **emits an `execute_tool` span** (the MCP `name` +
+  `arguments`) into the recorder, then delegates to the real handler. Sync and async.
+- **Out-of-process proxy** — `observe_call(frame)` emits a span for one parsed
+  JSON-RPC `tools/call` frame (`params.name` / `params.arguments` / `id`). It is
+  **non-blocking**: the proxy forwards the frame itself; the recorder only observes.
 
-Everything that isn't a `tools/call` (`initialize`, `tools/list`, notifications,
-server stderr) passes through byte-for-byte, so the proxy is invisible to both
-sides. This is the cleanest demonstration that the egress interception point *is*
-the witnessing point.
+Because the recorder is observe-only, **anything that must be refused goes through the
+egress gate** — the same fail-closed shim that gates every other outbound call. There
+is no separate gating MCP binary that itself blocks `tools/call`; enforcement is the
+egress gate's job. That keeps one enforcement lane (the gate) and one observability
+lane (the recorder), instead of two places that could each block.
 
 ## Rollout discipline — Shadow Mode
 

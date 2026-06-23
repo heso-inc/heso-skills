@@ -5,9 +5,10 @@ description: >-
   destructive actions at egress (classify-by-effect → redact → sign → forward or
   fail closed), route risky actions to a human approver, push a tamper-evident
   commitment to the cloud, and verify the signed receipt offline anywhere. Use
-  when wiring HESO into a codebase, choosing between the heso / @hesohq/sdk /
-  @hesohq/core / @hesohq/verify-wasm packages, classifying an action into a
-  destructive primitive, authoring policy-as-code (heso.toml, floors, simulate,
+  when wiring HESO into a codebase, choosing between the heso / @hesohq/engine /
+  @hesohq/gate / @hesohq/recorder / @hesohq/node / @hesohq/verify-wasm packages,
+  classifying an action into a destructive primitive, authoring policy-as-code
+  (heso.toml, floors, simulate,
   deploy), gating tools/LLM clients, enforcing a trust level (L0/L1), redacting
   fields, handling approvals/suspend-resume, wiring an embed (Slack approval card,
   Datadog/OTel, GitHub policy-as-code, Vanta), or verifying an Action Receipt.
@@ -16,7 +17,7 @@ description: >-
   approval", "verify a receipt", "commitment", "reconciliation", "trust level",
   "policy rule", "heso.toml", "Action Receipt", "redact".
 metadata:
-  version: 0.3.0
+  version: 0.4.0
   homepage: https://heso.ca/docs
   source: hesohq/heso-spec
 license: MIT
@@ -38,7 +39,7 @@ GATE (egress, fail-closed)           intercept the outbound call → classify-by
 ```
 
 The crypto is a single Rust core compiled three ways — a Python wheel
-(`heso._core`), a native Node addon (`@hesohq/core`), and a browser WASM module
+(`heso._core`), a native Node addon (`@hesohq/node`), and a browser WASM module
 (`@hesohq/verify-wasm`) — so a verdict is byte-identical on your server or in a
 reviewer's browser. Nobody re-implements canonicalization, BLAKE3, Ed25519, or the
 taxonomy in JS or Python; every binding is a thin layer over the one kernel.
@@ -91,15 +92,22 @@ FROZEN-7-verb mapping, and `ClassificationMismatch`:
 
 ## Pick the package first
 
-One core, four surfaces. Choose by the job, not the language.
+One core, many surfaces. Choose by the job, not the language. The Node SDK is
+**not a single `@hesohq/sdk` package** — it ships as small, separately published
+packages (`@hesohq/engine`, `@hesohq/gate`, `@hesohq/recorder`, `@hesohq/transport`)
+that all bind the same kernel through the native addon.
 
 | Package | Runtime | Use it to |
 | --- | --- | --- |
-| `heso` | Python ≥ 3.10 | **Record + gate** an agent (the lead binding — most adapters, suspend/resume). |
-| `@hesohq/sdk` | Node ≥ 18 | **Record + gate** a Node agent AND **verify** + push commitments to the cloud. Minting binds to `@hesohq/node`. |
-| `@hesohq/core` | Node ≥ 18 (native) | Raw primitives `@hesohq/sdk` binds to: verify, sign/mint, BLAKE3, chain/transparency verify, redaction, Ed25519. |
+| `heso` | Python ≥ 3.10 | **Record + gate** an agent (the lead binding — most adapters, suspend/resume). `import heso`, `heso.init()`, `@heso.tool` / `@heso.destructive`; `@gated` from `heso_gate`; framework adapters under `heso_recorder.adapters.*`. |
+| `@hesohq/engine` | Node ≥ 18 | The translation point (`normalizeFields`/`jsonable`/`buildAction`) + engine-FFI seam; `init()` lives here. Binds the kernel via `@hesohq/node`. |
+| `@hesohq/gate` | Node ≥ 18 | The fail-closed egress interceptor — the **only** surface that blocks. The credential floor is **default-on and transport-independent** (mints per kernel-classified destructive action, not per HTTP client). One-line egress install in **both** languages: `installGate()` (Node) / `install_gate()` (Python) arm every reachable transport process-wide. Exports `gate()` (sync classify/decide), `installGate`/`selfCheck`/`hesoGate`, + L1/quorum finalize. |
+| `@hesohq/recorder` | Node ≥ 18 | Async OTel GenAI-semconv consumer — **never blocks**. Exports `createRecorder()`; AI SDK adapter (`recordTool`/`recordTools`) at `@hesohq/recorder/adapters/ai-sdk`. |
+| `@hesohq/transport` | Node ≥ 18 | The injectable `Transport` interface + commitment wire DTOs. Zero I/O; the open packages depend only on this (the closed `@hesohq/cloud` implements it). |
+| `@hesohq/node` | Node ≥ 18 (native) | The native addon the JS packages bind for minting/verify: sign/mint, verify, BLAKE3, chain/transparency verify, redaction, Ed25519. |
 | `@hesohq/verify-wasm` | Browser | **Verify only**, client-side. No private key, no network. Also in-browser policy parse/preview/floor-check. |
 
+There is **no published `@hesohq/sdk` package** — never tell a user to install one.
 Gate in Python or Node; **verify anywhere** — the verdict matches across surfaces.
 Python: [references/python.md](references/python.md). Node:
 [references/typescript.md](references/typescript.md).
@@ -224,6 +232,24 @@ receipt in the browser with no login; an MIT/Apache-dual-licensed verifier crate
    receipts.
 6. **No insurance vocabulary.** Coverage/claim/payout is designed-not-built
    (Phase 2); it belongs in no code, including this skill.
+7. **Tiered honesty — the single coverage story.** State the floor's three tiers
+   exactly, never a blanket "total coverage" from the one-line install:
+   - **No forgeable receipt** — true **everywhere** (every minted receipt is
+     offline-verifiable; nobody can fake one).
+   - **Can't exceed scope** — true **given no standing key** (the floor's scoped,
+     capped, short-lived credentials bound the blast radius only while no broad
+     standing key sits in the environment — which is why the standing-key assert
+     fails closed at install).
+   - **No ungated action** — hard **only on the mediated / auto-instrumented path**;
+     elsewhere it degrades to **provably-flagged-after-the-fact** on **asymmetric
+     rails only** (CloudTrail / PayPal, third-party offline-verifiable). **HMAC
+     rails** (Stripe / GitHub / Slack) degrade further to **trust-the-rail** — the
+     rail's own ledger, no in-band proof. The one-line install NEVER implies an
+     un-mediated transport is hard-gated.
+8. **The no-standing-key keystone fails closed.** `installGate()` / `install_gate()`
+   assert no broad standing rail key is reachable, **fail-closed by default**; the
+   detector reports env-var name + rail + redacted shape only, **never the secret
+   value**. A standing key defeats the floor's whole bound, so it refuses to boot.
 
 ## When NOT to use HESO
 
@@ -243,7 +269,7 @@ receipt in the browser with no login; an MIT/Apache-dual-licensed verifier crate
 - [references/python.md](references/python.md) — Python decorators, `wrap`, `step`,
   blocking/shadow, suspend/resume, adapters, init.
 - [references/typescript.md](references/typescript.md) — Node gating, verify,
-  `gate`/`assertGate`, the transport + commitment push, exported types.
+  `gate`/`hesoGate`/`finalizeL1`, the transport + commitment push, exported types.
 - [references/policy.md](references/policy.md) — policy-as-code, the field catalog,
   bands, floors, simulate/deploy, packs.
 - [references/cloud.md](references/cloud.md) — commitment store, reconciliation,
