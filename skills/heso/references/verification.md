@@ -116,7 +116,16 @@ Beyond single receipts, the core verifies hash-linked chains and the transparenc
 log:
 
 - `verifyChain` / `verifySessionChain` — a BLAKE3 hash-linked sequence; a break
-  reports the sequence index that failed.
+  reports the sequence index that failed. **Two chain kinds, two verifiers — route
+  by the receipts' `content.kind`.** An **action** chain (every receipt an `action`)
+  is linked by `action_hash`; verify it with the action-chain verifier
+  (`verifyChain`). A **lifecycle / session** chain carries lifecycle kinds
+  (suspend → resume → supersede) and so has state transitions; verify it with
+  `verifySessionChain`. Point the wrong one at a chain — e.g. the lifecycle verifier
+  at a pure-action chain that legitimately repeats an identical action (a retry or
+  poll) — and the core now returns **`WrongChainKind`** (an honest "you ran the wrong
+  verifier") instead of a false transition break that would red-flag an intact chain.
+  Route by kind: all-`action` → `verifyChain`; any lifecycle kind → `verifySessionChain`.
 - `verifySessionChainWithRotation(receipts, producerKey, decisionKey?)` — chains
   across a key rotation (TOFU producer key).
 - `verifyInclusion` / `verifyConsistency` — RFC-6962 Merkle proofs (SHA-256) that

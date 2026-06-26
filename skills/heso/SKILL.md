@@ -156,7 +156,10 @@ Non-negotiables:
 - **Console approvals (how the co-sign actually happens).** A trusted, role-gated
   human approves the gated action in the web console and co-signs it **in the
   browser** with a per-device WebCrypto key. The thin cloud relays the detached
-  co-signature and **holds no signing key**; the operator SDK re-mints the L1,
+  co-signature and **holds no signing key** — and **no content body**: an action's
+  request/response body is offloaded to your own store (`put_body`), so the cloud
+  keeps only the receipt and its BLAKE3 commitment, never the raw content. The
+  operator SDK re-mints the L1,
   locally re-verifies it (`Valid(L1)`), and pushes it. The **same** relay flow
   drives a k-of-n quorum — each approver co-signs their own leg in their own browser.
   When a suspension opens, the org can notify approvers out of band (Resend email +
