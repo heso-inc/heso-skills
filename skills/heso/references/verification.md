@@ -116,16 +116,21 @@ Beyond single receipts, the core verifies hash-linked chains and the transparenc
 log:
 
 - `verifyChain` / `verifySessionChain` — a BLAKE3 hash-linked sequence; a break
-  reports the sequence index that failed. **Two chain kinds, two verifiers — route
-  by the receipts' `content.kind`.** An **action** chain (every receipt an `action`)
-  is linked by `action_hash`; verify it with the action-chain verifier
-  (`verifyChain`). A **lifecycle / session** chain carries lifecycle kinds
-  (suspend → resume → supersede) and so has state transitions; verify it with
-  `verifySessionChain`. Point the wrong one at a chain — e.g. the lifecycle verifier
-  at a pure-action chain that legitimately repeats an identical action (a retry or
-  poll) — and the core now returns **`WrongChainKind`** (an honest "you ran the wrong
-  verifier") instead of a false transition break that would red-flag an intact chain.
-  Route by kind: all-`action` → `verifyChain`; any lifecycle kind → `verifySessionChain`.
+  reports the sequence index that failed. **Two chain kinds, two verifiers — and
+  you must route by the receipts' `content.kind` yourself.** An **action** chain
+  (every receipt an `action`) is linked by `action_hash`; verify it with the
+  action-chain verifier (`verifyChain`). A **lifecycle / session** chain carries
+  lifecycle kinds (suspend → resume → supersede) and so has state transitions;
+  verify it with `verifySessionChain`. Route by kind: all-`action` → `verifyChain`;
+  any lifecycle kind → `verifySessionChain`. **A mis-route is not self-healing.**
+  Point `verifySessionChain` at a pure-action chain that legitimately repeats an
+  identical action (a retry or poll) and it returns `illegal_transition` (or
+  `double_terminal`) — a **false red on an intact chain**, not a real break. That
+  outcome is reached **only after** per-receipt crypto and the structural seq/link
+  checks have already passed, so it means "this is **not** one linear lifecycle
+  chain" (e.g. a legitimately repeated action), **never** tamper. Treat it as a
+  signal to **withhold** — never paint the chain broken on it. Real tamper surfaces
+  earlier and unambiguously as `content_tamper` or `link_broken`.
 - `verifySessionChainWithRotation(receipts, producerKey, decisionKey?)` — chains
   across a key rotation (TOFU producer key).
 - `verifyInclusion` / `verifyConsistency` — RFC-6962 Merkle proofs (SHA-256) that

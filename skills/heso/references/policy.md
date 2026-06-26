@@ -131,9 +131,14 @@ documented exemption, not a bypass.
 
 ## Default-deny
 
-Anything no rule matches is **blocked**. There is no implicit allow-all: an empty
-policy blocks everything, and you open lanes by adding rules. Combined with the
-floors, a policy gap fails safe rather than leaking a dangerous action through.
+Anything no rule matches is **routed to a human, not hard-blocked**. When no rule
+fires, the engine applies a synthetic `policy.default.deny_unknown` rule whose
+decision is **`require_approval`** — the action **suspends** (the Python SDK raises
+`SuspendedError`, never `BlockedError`, so `except BlockedError` will **not** catch
+it) and waits for an approver. There is no implicit allow-all: an empty policy
+**suspends** everything (it neither silently allows nor hard-blocks), and you open
+lanes by adding `allow` rules. Combined with the floors, a policy gap fails safe —
+it waits for a human rather than leaking a dangerous action through.
 
 ## Trusted time (optional, Required-gated)
 
