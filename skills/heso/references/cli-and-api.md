@@ -89,7 +89,7 @@ before push.
 
 If a policy marks trusted time **Required** for the lane, the pushed receipt must
 carry a verifiable RFC-3161 `time_anchor` — an unanchored one fails re-verification
-(`AnchorRequired`, a 422), exactly as the offline verifier would reject it.
+(`AnchorRequired`, a **409**), exactly as the offline verifier would reject it.
 
 The server **re-verifies** every receipt through the same Rust core before
 accepting it — a tampered or under-signed receipt is rejected at the control plane,
@@ -99,10 +99,12 @@ not just locally.
 
 | Code | Meaning |
 | --- | --- |
-| 400 | Malformed JSON or schema validation failure |
+| 201 | Receipt accepted (`status` = `appended` / `duplicate` / `quota_exceeded`) |
 | 401 | Invalid API key |
+| 403 | API key lacks the required scope (e.g. a read-only key pushing to the `receipts:write` route) |
 | 404 | Not found |
-| 422 | Receipt failed server re-verification |
+| 409 | Receipt **failed server re-verification** — `action_hash` mismatch, or any non-`Valid` verdict |
+| 422 | Schema-invalid body — e.g. `content` missing / not an object, or no `action_hash` (also unparseable JSON) |
 | 429 | Rate limited (honor `Retry-After`) |
 | 503 | Server at capacity (honor `Retry-After`) |
 

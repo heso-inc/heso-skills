@@ -106,6 +106,14 @@ gates `.create()` as `llm_call` and `.request()` as `http_request`, and passes
 everything else through. On a refused gate it raises `BlockedError` or
 `SuspendedError`.
 
+> **Known gap — don't rely on `wrap()` alone yet.** The nested-namespace reach is
+> being fixed and is **not reliable on the latest `openai` SDK** as written: on
+> current `openai` the `client.chat.completions.create` leaf can **fail open** —
+> the call runs ungated and produces **no receipt**, silently (no `BlockedError`,
+> no `SuspendedError`, nothing). Until the fix lands, gate the OpenAI call site
+> explicitly (wrap it in a `@heso.tool` function or scope it under `heso.step`) so a
+> missed leaf cannot pass through unsigned.
+
 ## Scope a unit of work — `heso.step()`
 
 ```python
@@ -124,11 +132,15 @@ instead of running. The action is captured and an approval opens for the
 configured approvers; once a human co-signs with a device-held key the receipt
 reaches **L1** and the work can resume. The lower-level suspend/resume API:
 
-- `configure(...)`, `gated(callable)`, `gate(action)`, `gate_async(action)` —
-  gate an action and get a `Gate` result.
-- `resume(action_hash)` → a `ResumeOutcome`; `decision(action_hash)` reads the
-  current decision; `append_decision(action_hash, decision)` records one;
-  `current_action_hash()` for the in-flight action.
+- `configure(...)`; `@gated` (decorate a side-effecting function — it parks and
+  resumes under the `_heso_session` passed at call time); `gate(spec, *, session=...)`
+  / `gate_async(spec, *, session=...)` — the escape-hatch context managers, keyed by
+  `session`, yielding a `Gate`.
+- `resume(session)` → a `ResumeOutcome`; `decision(session)` reads the current
+  decision; `append_decision(session, kind)` records one (the WRITE half);
+  `current_action_hash()` for the in-flight action hash. **Suspend/resume is keyed
+  by the `session` string you parked under, NOT by `action_hash`** — an
+  `action_hash` argument will not resolve the session.
 - Outcome/marker types: `Gate`, `ResumeOutcome`, `SUSPENDED`, `DENIED`, `Paused`,
   `ContextLost`.
 

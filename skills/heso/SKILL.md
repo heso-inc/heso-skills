@@ -172,7 +172,13 @@ Non-negotiables:
   under a stale key.
 - **Gate a whole client with `heso.wrap()`** — gates `.create()` as `llm_call`,
   `.request()` as `http_request`, reaches nested attrs
-  (`client.chat.completions.create(...)`), passes the rest through.
+  (`client.chat.completions.create(...)`), passes the rest through. **Known gap:**
+  the nested-namespace reach is being fixed and is **not reliable on the latest
+  `openai` SDK** as written — on current `openai` the
+  `client.chat.completions.create` leaf can **fail open** (the call runs ungated,
+  with **no receipt**), silently. Until the fix lands, don't rely on `wrap()` alone
+  for the OpenAI client — gate the call site explicitly (a `@heso.tool` wrapper or
+  `heso.step`) so a missed leaf can't pass through unsigned.
 - **Adapters:** `heso.HesoCallbackHandler()` for LangChain/LangGraph; `heso.wrap()`
   for OpenAI/Anthropic; lazy namespaces `heso.crewai`, `heso.openai_agents`,
   `heso.claude_agent`, `heso.pydantic_ai`, `heso.langgraph`, `heso.mcp`.
@@ -224,8 +230,9 @@ if (isDecisionAllowed(receipt, ["allow", "redact"])) proceed()  // branch on pol
   from `gate()`.
 - **`assertGate(json, "L1")`** before money movement or destructive ops.
 - **Push re-verifies server-side.** `pushReceipt()` sends to the cloud outbox;
-  the server re-runs the identical check and rejects a tampered body (HTTP 422).
-  The result `status` is `appended` / `duplicate` / `quota_exceeded`.
+  the server re-runs the identical check and rejects a tampered body (HTTP **409**;
+  a schema-invalid body is 422). A successful push is 201, with `status`
+  `appended` / `duplicate` / `quota_exceeded`.
 - **`configure(apiKey, endpoint)` once** before any cloud call; local
   `gate`/`assertGate` need no config and no network.
 
@@ -304,7 +311,12 @@ as live gallery packs yet.
 
 Hard rules:
 
-- **Default-deny.** Anything no rule matches is **blocked**.
+- **Default-deny routes to a human — it does not hard-block.** Anything no rule
+  matches fires a synthetic `policy.default.deny_unknown` rule whose decision is
+  **`require_approval`**, so the action **suspends** (Python raises `SuspendedError`)
+  and routes to an approver — it is **not** a `block`, and `except BlockedError`
+  will **not** catch it. There is no implicit allow-all; open lanes with `allow`
+  rules. A policy gap fails safe (waits for a human), never leaks through.
 - **Pinned floors can't be allowed away.** The dangerous lanes — `payment`,
   `delete`, `account_change`, `data_export` — carry a floor (plus a second floor:
   a `payment` with no valid mandate). A policy may *tighten* a floor but can never
