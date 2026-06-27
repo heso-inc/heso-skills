@@ -1,0 +1,22 @@
+# heso skill — markdown / docs
+
+# Agent / editor / OS state
+.omc/
+.conductor/
+.cursor/
+.agents/
+.DS_Store
+*.swp
+
+# Python tooling (reference snippets / scripts)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# Env / secrets (keep .env.example)
+.env
+.env.*
+!.env.example

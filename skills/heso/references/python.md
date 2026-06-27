@@ -1,11 +1,16 @@
 # Python gating reference (`heso`)
 
-The `heso` package (Python ≥ 3.10) is the only HESO surface that **captures and
-signs** an agent's actions. It runs in-process — the Rust core ships as the
-`heso._core` wheel, so there is no subprocess for gate operations. Capture, policy
-evaluation, signing, and the audit chain all happen inside your process.
-Auto-instrumentation was removed; supported gating is the decorators, `wrap()`,
-and the framework adapters.
+The `heso` package (Python ≥ 3.10) is the **lead binding** — the deepest capture
+surface (most adapters, suspend/resume). It runs in-process — the Rust core ships
+as the `heso._core` wheel, so there is no subprocess for gate operations. Capture,
+classify-by-effect, signing, and the audit chain all happen inside your process.
+
+HESO has **two capture surfaces** — the async **recorder** (off the hot path, an
+OTel GenAI consumer) and the fail-closed **gate** (the egress interceptor that
+blocks). The conceptual split and the two pillars (keys customer-side,
+redact-before-sign) are in [recorder-and-gate.md](recorder-and-gate.md); this page
+is the Python API. The decorators, `wrap()`, and the framework adapters are the
+supported surface (auto-instrumentation was removed).
 
 ## Scaffold
 
@@ -80,9 +85,9 @@ def call_partner_api(api_key: str, endpoint: str) -> dict:
 
 **Blocking** is the default (`blocking=True`, set on `heso.init`, not per-decorator):
 a blocked action raises `BlockedError` *before* the body runs. `blocking=False` is
-shadow mode — useful to
-roll HESO out and collect receipts (including for what *would* be blocked) without
-changing behavior, then flip to blocking once the policy looks right.
+shadow mode — useful to roll HESO out and collect receipts (including for what
+*would* be blocked) without changing behavior, then flip to blocking once the
+policy looks right.
 
 The call's arguments become the action's `fields`, so policy conditions match them.
 
@@ -125,6 +130,53 @@ with heso.step(workflow="run-42"):
 Every action captured inside the block is scoped to that workflow, matchable by a
 `workflow` subject in policy.
 
+## Install the egress gate — `install_gate()` (the one-liner)
+
+The egress gate (`heso_gate`) has **one process-wide install**, not a per-client
+tax. `install_gate()` runs the no-standing-key assert **first** (fail-closed),
+auto-instruments the available clients (httpx / requests / urllib3 / aiohttp), and
+stores the process-global default credential floor:
+
+```python
+from heso_gate import install_gate
+
+install_gate()   # standing-key assert (fail-closed) → auto-instrument httpx/requests/urllib3/aiohttp
+```
+
+The credential floor mints **per kernel-classified destructive action** at the
+credential boundary — transport-independent, decoupled from which HTTP client got
+the in-process shim. Conceptual split + the tiered honesty (mediated vs un-mediated,
+asymmetric vs HMAC rails) is in [recorder-and-gate.md](recorder-and-gate.md).
+
+**Per-client shims are the fallback**, for a client `install_gate()` cannot reach:
+`HesoGateTransport` / `HesoGateAsyncTransport` on an `httpx.Client` / `AsyncClient`,
+and `HesoGateAdapter` mounted on a `requests.Session`'s `https://`.
+
+```python
+import httpx
+from heso_gate import HesoGateTransport
+client = httpx.Client(transport=HesoGateTransport(httpx.HTTPTransport()))  # fallback
+```
+
+### Self-check — escalates loudly
+
+`self_check()` returns a `SelfCheckReport`: `.gated` names the **mediated**
+(auto-instrumented) clients, `.uncoverable` names the transports the gate **cannot**
+see at all (raw `socket`, `subprocess`), and `.escalations` aggregates every
+un-mediated / uncoverable surface plus every reachable standing key. `.ok` is true
+only when `.escalations` is empty; `self_check(raise_on_gap=True)` raises
+`SelfCheckGapError`. The per-client `check_httpx_client(client)` /
+`check_requests_session(session)` cover the fallback shims.
+
+### Standing-key check — fails closed
+
+`install_gate()` runs `assert_no_standing_key()` first, **fail-closed by default**:
+a reachable broad standing rail key (`sk_live_*`, long-lived `AKIA*`, `ghp_*`,
+`xoxb-*`) raises `StandingKeyError` before any shim arms, because a standing key the
+floor cannot bound defeats the floor's guarantee. The detector reports only the
+env-var name, rail, redacted shape, and severity — **never the secret value**.
+Override deliberately with `install_gate(strict_standing_key=False)`.
+
 ## Approvals — suspend / resume
 
 When policy returns `require_approval`, a gated call raises **`SuspendedError`**
@@ -132,10 +184,12 @@ instead of running. The action is captured and an approval opens for the
 configured approvers; once a human co-signs with a device-held key the receipt
 reaches **L1** and the work can resume. The lower-level suspend/resume API:
 
-- `configure(...)`; `@gated` (decorate a side-effecting function — it parks and
-  resumes under the `_heso_session` passed at call time); `gate(spec, *, session=...)`
-  / `gate_async(spec, *, session=...)` — the escape-hatch context managers, keyed by
-  `session`, yielding a `Gate`.
+- `configure(...)`, `gated(callable)`, `gate(spec, *, session=...)` /
+  `gate_async(spec, *, session=...)` — the escape-hatch context managers, keyed by
+  `session`, yielding a `Gate`. `@gated` is **named-approval sugar** — an explicit
+  "this function needs a human decision" annotation that routes a specific function
+  to a named approver regardless of its wire effect; it is not the egress path
+  (that is `install_gate()`).
 - `resume(session)` → a `ResumeOutcome`; `decision(session)` reads the current
   decision; `append_decision(session, kind)` records one (the WRITE half);
   `current_action_hash()` for the in-flight action hash. **Suspend/resume is keyed
@@ -144,29 +198,22 @@ reaches **L1** and the work can resume. The lower-level suspend/resume API:
 - Outcome/marker types: `Gate`, `ResumeOutcome`, `SUSPENDED`, `DENIED`, `Paused`,
   `ContextLost`.
 
-**How the co-sign actually happens (console + relay).** A trusted, role-gated human
-approves in the web console and co-signs the action **in their browser** with a
-per-device key; the thin cloud relays the detached co-signature and **holds no
-signing key**. The operator side fetches the relayed parts and re-mints + locally
-re-verifies the L1 before pushing:
+The co-sign / relay flow and the key-rotation fail-closed behavior are **one
+canonical statement** in [SKILL.md](../SKILL.md); quorum semantics are in
+[receipts.md](receipts.md). The Python API onto them:
 
 - `heso.cloud.get_l1_parts(action_hash)` → `L1Parts`, then
   `heso.finalize_l1(action_hash, suspended_content, parts)` assembles the
   single-approver L1 and pushes it.
 - `heso.cloud.get_quorum_parts(action_hash)` → `QuorumParts`, then
   `heso.finalize_quorum(action_hash, suspended_content, parts)` assembles a **k-of-n
-  quorum** receipt. A quorum re-derives to **L1 with a `multi_approval` block** — not
-  a higher level, and honestly narrower per approver (the operator signs only the
-  action + threshold + roster). Under-quorum at verify is `ThresholdNotMet`.
+  quorum** (re-derives to **L1** with a `multi_approval` block; under-quorum at
+  verify is `ThresholdNotMet`). `finalize_quorum` takes `loaded_operator_pubkey_b64`
+  (the proactive rotation check) and an `on_key_rotation` callback that re-suspends
+  under the new key (a fresh suspended L0 with a new `action_hash`,
+  `OperatorKeyMismatchError` on a stale base).
 - A non-approved record makes either finalize raise before touching the keystore;
   every leg of a quorum must be `approved`.
-
-**Key rotation fails closed.** If the operator key rotates between suspend and
-finalize, the in-core assemble rejects the stale base (`OperatorKeyMismatchError`).
-`finalize_quorum` takes `loaded_operator_pubkey_b64` (proactive check) and an
-`on_key_rotation` callback that re-suspends under the new key — a fresh suspended L0
-with a new `action_hash` the approval re-opens against. Never a silent mint under a
-stale key.
 
 `heso.process(action: Action) -> Outcome` runs the full pipeline imperatively for
 a manually-built `Action`.
@@ -213,6 +260,5 @@ Capture timing (`captured_at`) is the operator's own clock — **informational o
 An optional RFC-3161 `time_anchor` can bind when the (post-approval) receipt body
 existed; it is off by default, so most receipts carry no trusted time.
 
-A receipt proves the operator *authorized* the action under a known policy, and at
-L1 that one or more people *approved* it (single-approver, or a k-of-n quorum) with
-device-held keys. It does not prove the action *succeeded* downstream.
+A receipt proves **authorization** (and at L1 human approval), never a downstream
+outcome — see the honesty rules in [SKILL.md](../SKILL.md).

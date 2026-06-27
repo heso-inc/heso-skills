@@ -1,162 +1,21 @@
 # Policy reference
 
-**Policy is authored in the HESO dashboard (`/policy`), not by hand-editing
-TOML.** `heso.toml` is the underlying file format the engine reads; the dashboard
-is the authoring surface and renders the exact rule sentences that land on
-receipts. The engine sorts rules by ascending `order` and does first-match-wins —
-the first rule whose subject + verb + scope + conditions all match decides, and
-its decision is stamped onto the receipt. No scoring.
+**Policy is code.** It lives in the repo as `heso.toml`, is reviewed in a PR, and
+is enforced by a GitHub status check that lints it and **proves** invariants
+before merge — see the GitHub policy-as-code embed in [embeds.md](embeds.md). The
+web dashboard (`/policy`) is **one** authoring surface (a visual editor whose
+edits flow to a PR against the same policy-as-code source), **not** the home of
+policy. Both compile to the same `heso.toml` the engine reads.
 
-## Importance bands (how the UI models order)
+The engine sorts rules by ascending `order` and does **first-match-wins** — the
+first rule whose subject + verb + scope + conditions all match decides, and its
+decision is stamped onto the receipt. No scoring.
 
-You never type raw `order` numbers. Rules live in named **bands** that compile
-down to the engine's `order: i64` (a web-only abstraction; the engine is
-untouched). Bands map to disjoint order ranges so a rule's band can be inferred
-back from its order on pull:
+## `heso.toml` (the source of truth)
 
-| Band | Order range | Base | Role |
-| --- | --- | --- | --- |
-| **Always-on** | — | — | The two pinned **floors**. Read-only, always applied, can't be turned off. NOT part of the `[[rule]]` array. |
-| **Exceptions** | 0–999 | 0 | Narrowing carve-outs. Checked **first**. |
-| **Guardrails** | 1000–1999 | 1000 | The core policy. |
-| **Baseline** | 2000–2999 | 2000 | Catch-all defaults. Checked **last**. |
-
-Each band owns 1000 positions. Reordering is **within a band** (up/down), and
-every add/duplicate/move/delete reindexes the band so orders stay
-`band_base + position`. "Add exception" on a guardrail/baseline rule creates a
-carve-out pre-scoped above it (lands in Exceptions). Any order ≥ 2000 (including
-legacy / hand-edited TOML) reads as Baseline.
-
-## Authoring a rule
-
-A rule pins:
-
-- **subject** — `{ kind: "any" | "workflow" | "account", value? }` — who the
-  action belongs to (`value` names the workflow/account; omit for `any`).
-- **verb** — `"any"` or one of the seven: `llm_call`, `tool_call`,
-  `http_request`, `payment`, `data_export`, `account_change`, `delete`.
-- **scope** — a host glob matched against the action's `target_host`, or `"*"`.
-- **conditions** — zero or more field checks, a pure **AND** (all must hold).
-- **decision** — `allow` | `block` | `redact` | `require_approval`.
-- **approvers** + **sla_minutes** — for `require_approval`. A rule can require a
-  **quorum** — k distinct approvals rather than a single co-sign. Honest v1
-  semantics: this is "**k distinct registered org approvers**", recorded with
-  `threshold` = how many signed; a gate-time operator-pinned roster with a true
-  `k < n` (the eligible set fixed before any approver signs) is a **noted
-  follow-up**, not yet built. A quorum receipt re-derives to **L1** with a
-  `multi_approval` block — not a higher level.
-
-Each rule renders to a plain-English **sentence** (`rule_display`) via the
-Rust-faithful `ruleToSentence`, shown live as you author and stamped onto the
-receipt's `policy.rule_display`. The UI also flags a rule that can **never run**
-because an earlier, broader rule shadows it (first-match-wins).
-
-## The condition builder
-
-Conditions are built **field → operator → value**. The operators offered are
-constrained to the field's type, and the value widget is shaped by the operator
-(a money field gets a `$` threshold editor; an enum gets a dropdown; `in`/`not_in`
-get a multi-value input; `exists` takes no value).
-
-**Operators** (`ConditionOp`): `gt`, `lt`, `gte`, `lte`, `eq`, `neq`, `in`,
-`not_in`, `exists`, `matches`.
-
-**Field types** (`FieldType`): `bool`, `enum`, `host`, `money`, `number`,
-`string`. `OPS_BY_TYPE` maps each type to its legal operators (e.g. a money field
-can't `matches` a string).
-
-**Fields are per-verb.** The catalog (`POLICY_FIELDS[verb]`, plus shared
-`ANY_VERB_FIELDS` and `DERIVED_FIELDS`) only offers fields the engine can
-actually match — no phantom fields. Representative examples:
-
-- `llm_call`: `provider` (`openai`|`anthropic`|`google`|`aws`|`cohere`|`local`|
-  `other`), `host`, `modality` (`text`|`image`|`audio`|`video`|`multimodal`),
-  `pii_status` (`not_scanned`|`clean`|`found`).
-- `payment`: `budget` (money), `currency` (`USD`|`EUR`|…|`USDC`|`USDT`|`other`).
-- `http_request`: `host`, `http_method` (`GET`|`POST`|…), `pii_status`,
-  `origin`.
-- `account_change`: `environment` (`dev`|`staging`|`prod`|`unknown`), `effect`
-  (`read_only`|`mutating`|`destructive`).
-- Derived/any-verb fields apply across verbs (e.g. a `mandate.verdict` of
-  `valid`|`invalid`|`absent`).
-
-Every edit recomputes the condition's `display` string via the Rust-faithful
-composer (`composeConditionDisplay`) so the live sentence stays honest.
-
-## Simulate, then deploy
-
-- **Simulate** (`/policy/simulate`): run a captured action against the working
-  (unsaved) policy and see which rule matches and what it decides — before
-  shipping. The dashboard runs the real first-match-wins engine for this; there is
-  no `evaluatePolicy` in the verify-wasm surface (client-side you have
-  `parsePolicy` / `policyRulesFromToml` / `ruleToSentence` / `validateNoFloorBypass`).
-- **Deploy**: edits are held client-side until you deploy. A persistent
-  **Review & sign** bar (visible on every policy sub-route while there are
-  unsaved changes) deploys to the Rust engine — `deployPolicy(rules, policyHash)`
-  returns a `policy_id`. Only **Security Admin** and **Owner** roles hold the
-  `deploy_policy` permission.
-
-## Curated policy packs
-
-HESO ships curated **policy packs** — bundles of tighten-only `require_approval`
-rules mapped to a framework's controls. They are a starting point, not a separate
-engine: a pack **merges into the active policy via deploy** and is enforced by the
-same first-match-wins floors-and-all engine. Because every pack rule is
-tighten-only, a pack can never trip the `[FLOOR_BYPASS]` validator.
-
-Current packs (`specs/packs/*.toml` + `manifest.toml`): `AI Agent Baseline` (the
-single free **starter** pack), `SOC 2`, `ISO/IEC 27001`, `HIPAA`, and — authored
-but **draft / unpublished** (`is_published = false`, hidden from the gallery until
-the control set is reviewed) — `ISO/IEC 42001` and `NIST AI RMF`. Each pack carries
-a content hash (`pack_hash = blake3(rules_toml)`) that drives "update available",
-and a `min_plan`: `min_plan` gates **enforcing** a pack (free orgs get the starter
-pack; SOC 2 and beyond are Pro+), while **preview / simulate stay free** for
-everyone. Do not present ISO 42001 / NIST AI RMF as live, installable gallery
-packs — they exist in source but are unpublished.
-
-## Pinned floors (always-on)
-
-`payment`, `delete`, `account_change`, and large `data_export` carry a built-in
-floor enforced when the engine loads the policy. A policy may **tighten** a floor
-but can never `allow` one of these lanes without approval. If it tries, the policy
-is **rejected at load** with a `[FLOOR_BYPASS]` error naming the offending rule id
-and verb. The two floors render in the read-only **Always-on** band; they are not
-editable rules.
-
-The human-approval floor is enforced in the **untrusted external-delegation** lane
-(the iframe/external-client path). An authenticated, role-gated, device-pinned
-**console approver** satisfies it **by identity** — they are the trusted human the
-floor exists to guarantee, so they don't traverse the iframe guard. This is a
-documented exemption, not a bypass.
-
-## Default-deny
-
-Anything no rule matches is **routed to a human, not hard-blocked**. When no rule
-fires, the engine applies a synthetic `policy.default.deny_unknown` rule whose
-decision is **`require_approval`** — the action **suspends** (the Python SDK raises
-`SuspendedError`, never `BlockedError`, so `except BlockedError` will **not** catch
-it) and waits for an approver. There is no implicit allow-all: an empty policy
-**suspends** everything (it neither silently allows nor hard-blocks), and you open
-lanes by adding `allow` rules. Combined with the floors, a policy gap fails safe —
-it waits for a human rather than leaking a dangerous action through.
-
-## Trusted time (optional, Required-gated)
-
-Trusted time is **off by default** — most receipts carry no time anchor. A policy
-can mark trusted time **Required** for a lane; the engine then stamps the signed
-`anchor_policy = Required` on those receipts, and a receipt that lane produces must
-carry a verifiable RFC-3161 `time_anchor` or it **fails verification**
-(`AnchorRequired`). This is enforced by the **offline verifier itself**, not only by
-the server. The anchor bounds when the post-approval body existed — not when a human
-decided.
-
-## `heso.toml` (the underlying format)
-
-The dashboard compiles rules to TOML and pulls them back (`rulesToToml` /
-`parseRulesFromToml`). `heso init` writes a starter `heso.toml`; the local Python
-engine discovers it by walking **upward** from the project root and reads it
-in-process. Commit the policy; the local data dir (`heso-local-data/`) is
-gitignored. A single `[[rule]]` block:
+`heso init` writes a starter `heso.toml`; the local Python engine discovers it by
+walking **upward** from the project root and reads it in-process. **Commit the
+policy**; the local data dir (`heso-local-data/`) is gitignored. A single rule:
 
 ```toml
 [[rule]]
@@ -174,8 +33,128 @@ approvers = ["finance-lead", "cfo"]
 sla_minutes = 120
 ```
 
-You *can* hand-edit TOML (the Python engine reads it directly), but the dashboard
-is the source of truth for teams — it shows the rule sentence, runs floor
-validation, catches shadowed rules, and round-trips the band structure. Hand-edits
-beyond the band ranges still work (they degrade to Baseline) but lose those
-checks until re-pulled.
+Hand-edit it freely (the Python engine reads it directly) — but route real changes
+through a PR so the GitHub embed can lint, floor-validate, prove invariants, and
+catch shadowed rules. The visual dashboard editor renders the same plain-English
+sentence (`rule_display`) that lands on the receipt.
+
+## Authoring a rule
+
+A rule pins:
+
+- **subject** — `{ kind: "any" | "workflow" | "account", value? }`.
+- **verb** — `"any"` or one of the seven coarse verbs (`llm_call`, `tool_call`,
+  `http_request`, `payment`, `data_export`, `account_change`, `delete`). Policy
+  keys on the verb; the verb maps to a destructive primitive — see
+  [taxonomy.md](taxonomy.md).
+- **scope** — a host glob matched against the action's `target_host`, or `"*"`.
+- **conditions** — zero or more field checks, a pure **AND** (all must hold).
+- **decision** — `allow` | `block` | `redact` | `require_approval`.
+- **approvers** + **sla_minutes** — for `require_approval`. A rule can require a
+  **quorum** (k distinct approvals). Quorum semantics, what each signer vouches
+  for, and the `multi_approval` block live in [receipts.md](receipts.md) — a
+  quorum re-derives to **L1**, not a higher level.
+
+Each rule renders to a `rule_display` sentence via the Rust-faithful
+`ruleToSentence`. The UI flags a rule that can **never run** because an earlier,
+broader rule shadows it (first-match-wins).
+
+## The condition builder
+
+Conditions are **field → operator → value**, with operators constrained to the
+field's type.
+
+- **Operators** (`ConditionOp`): `gt`, `lt`, `gte`, `lte`, `eq`, `neq`, `in`,
+  `not_in`, `exists`, `matches`.
+- **Field types** (`FieldType`): `bool`, `enum`, `host`, `money`, `number`,
+  `string`. `OPS_BY_TYPE` maps each type to its legal operators (a money field
+  can't `matches` a string).
+- **Fields are per-verb** (`POLICY_FIELDS[verb]` + shared `ANY_VERB_FIELDS` /
+  `DERIVED_FIELDS`) — only fields the engine can actually match. Representative:
+  `llm_call` → `provider` / `host` / `modality` / `pii_status`; `payment` →
+  `budget` (money) / `currency`; `http_request` → `host` / `http_method` /
+  `pii_status` / `origin`; `account_change` → `environment` / `effect`. A
+  derived `mandate.verdict` is `valid` | `invalid` | `absent`.
+
+Every edit recomputes the condition's `display` via the Rust-faithful composer so
+the live sentence stays honest.
+
+## Importance bands (how the UI models order)
+
+You never type raw `order` numbers. Rules live in named **bands** that compile
+down to the engine's `order: i64` (a web-only abstraction; the engine is
+untouched):
+
+| Band | Order range | Role |
+| --- | --- | --- |
+| **Always-on** | — (read-only) | The pinned **floors**. Always applied, can't be turned off. NOT part of the `[[rule]]` array. |
+| **Exceptions** | 0–999 | Narrowing carve-outs. Checked **first**. |
+| **Guardrails** | 1000–1999 | The core policy. |
+| **Baseline** | 2000–2999 | Catch-all defaults. Checked **last**. |
+
+Each band owns 1000 positions; reordering is **within a band**, and every edit
+reindexes so orders stay `band_base + position`. "Add exception" creates a
+carve-out pre-scoped above a rule (lands in Exceptions). Any order ≥ 2000
+(including legacy / hand-edited TOML) reads as Baseline.
+
+## Pinned floors (always-on)
+
+`payment`, `delete`, `account_change`, and large `data_export` carry a built-in
+**floor** enforced when the engine loads the policy (plus a second floor: a
+`payment` with no valid mandate). A policy may **tighten** a floor but can never
+`allow` one of these lanes without approval — try, and the policy is **rejected at
+load** with a `[FLOOR_BYPASS]` error naming the offending rule id and verb. The
+floors render in the read-only **Always-on** band.
+
+The human-approval floor is enforced in the **untrusted external-delegation** lane
+(the iframe / external-client path). An authenticated, role-gated, device-pinned
+console approver satisfies it **by identity** — a documented exemption, not a
+bypass.
+
+## Default-deny
+
+Anything no rule matches is **routed to a human, not hard-blocked.** When no rule
+fires, the engine applies a synthetic `policy.default.deny_unknown` rule whose
+decision is **`require_approval`** — the action **suspends** (the Python SDK raises
+`SuspendedError`, never `BlockedError`, so `except BlockedError` will **not** catch
+it) and waits for an approver. There is no implicit allow-all: an empty policy
+**suspends** everything; open lanes by adding `allow` rules. Combined with the
+floors and the taxonomy's deny-unknown (`residual` fails closed — see
+[taxonomy.md](taxonomy.md)), a policy gap fails safe rather than leaking.
+
+## Simulate, then deploy
+
+- **Simulate** — run a captured action against the working policy and see which
+  rule matches and what it decides, before shipping (the GitHub embed runs this in
+  CI on the PR; the dashboard runs it interactively). Client-side you have only
+  `parsePolicy` / `policyRulesFromToml` / `ruleToSentence` /
+  `validateNoFloorBypass` — there is **no** decision-against-action
+  `evaluatePolicy` in the verify-wasm surface.
+- **Deploy** — `deployPolicy(rules, policyHash)` returns a `policy_id`; only
+  **Security Admin** / **Owner** hold the `deploy_policy` permission.
+
+## Curated policy packs
+
+HESO ships curated **policy packs** — bundles of **tighten-only**
+`require_approval` rules mapped to a framework's controls. A pack is a starting
+point, not a separate engine: it **merges into the active policy via deploy** and
+runs through the same first-match-wins floors-and-all engine, so it can never trip
+the `[FLOOR_BYPASS]` validator. Each pack carries a content hash (`pack_hash =
+blake3(rules_toml)`) that drives "update available" and a `min_plan` that gates
+**enforcing** a pack (preview / simulate stay free for everyone).
+
+> **Pack readiness is data, not prose.** Which packs are published vs. draft, and
+> each pack's `min_plan`, live in the open spec's machine-readable
+> `heso-spec/packs/manifest.toml`. Read the manifest for the live set rather than
+> trusting a list written here — a hardcoded "draft / unpublished" note rots
+> silently. Do not present a draft pack as a live, installable gallery pack.
+
+## Trusted time (optional, Required-gated)
+
+Trusted time is **off by default** — most receipts carry no anchor. A policy can
+mark trusted time **Required** for a lane; the engine then stamps the signed
+`anchor_policy = Required`, and a receipt that lane produces must carry a
+verifiable RFC-3161 `time_anchor` or it **fails verification** (`AnchorRequired`,
+enforced by the **offline verifier itself**, not only the server). The anchor
+bounds when the post-approval body existed — **not** when a human decided. See
+[verification.md](verification.md).
