@@ -1,313 +1,179 @@
 ---
 name: heso
 description: >-
-  Add HESO governance to an AI agent: gate every action against policy, sign it
-  into a tamper-evident Action Receipt, route risky actions to a human approver,
-  and verify receipts offline anywhere. Use when wiring HESO into a codebase,
-  choosing between the heso / @hesohq/sdk / @hesohq/core / @hesohq/verify-wasm
-  packages, authoring policy (importance bands, conditions, floors, simulate,
-  deploy) or a heso.toml, gating tools/LLM clients, enforcing a trust level
-  (L0/L1), redacting fields, handling approvals/suspend-resume, or verifying an
-  Action Receipt and reading its verdict. Triggers on "gate the agent", "sign
-  this action", "require approval", "verify a receipt", "trust level", "policy
-  rule", "heso.toml", "Action Receipt", "redact".
+  Add HESO governance to an AI agent: record every step off the hot path, gate
+  destructive actions at egress (classify-by-effect → redact → sign → forward or
+  fail closed), route risky actions to a human approver, push a tamper-evident
+  commitment to the cloud, and verify the signed receipt offline anywhere. Use
+  when wiring HESO into a codebase, choosing between the heso / @hesohq/engine /
+  @hesohq/gate / @hesohq/recorder / @hesohq/node / @hesohq/verify-wasm packages,
+  classifying an action into a destructive primitive, authoring policy-as-code
+  (heso.toml, floors, simulate,
+  deploy), gating tools/LLM clients, enforcing a trust level (L0/L1), redacting
+  fields, handling approvals/suspend-resume, wiring an embed (Slack approval card,
+  Datadog/OTel, GitHub policy-as-code, Vanta), or verifying an Action Receipt.
+  Triggers on "gate the agent", "record the agent", "classify the action",
+  "destructive primitive", "sign this action", "require approval", "Slack
+  approval", "verify a receipt", "commitment", "reconciliation", "trust level",
+  "policy rule", "heso.toml", "Action Receipt", "redact".
 metadata:
-  version: 0.2.0
+  version: 0.4.0
   homepage: https://heso.ca/docs
-  source: heso-inc/heso-web
+  source: hesohq/heso-spec
 license: MIT
 ---
 
-# HESO — govern, sign, and prove every agent action
+# HESO — record, gate, and prove every agent action
 
-HESO sits between your AI agent and the world. Every action — an LLM call, a
-tool call, an HTTP request, a payment, a delete — runs through one pipeline:
+HESO sits between your AI agent and the world. It is an **open trust standard**
+(the spec, the taxonomy, and the verifier are open) wrapped around two
+customer-side capture surfaces:
 
 ```
-capture → check against policy → decide (allow/block/redact/require_approval)
-        → sign into an Action Receipt → hash-link into an audit chain
-        → verify offline, anywhere, byte-for-byte
+RECORDER (async, off the hot path)   observe every step → fingerprint → sign → append
+GATE (egress, fail-closed)           intercept the outbound call → classify-by-effect
+                                      → redact → sign a commitment → forward OR fail closed
+        → push a COMMITMENT (fingerprint + index, NOT the body) to the cloud
+        → reconcile the signed trail against the rails' own ledgers
+        → verify the signed receipt offline, anywhere, byte-for-byte
 ```
 
 The crypto is a single Rust core compiled three ways — a Python wheel
-(`heso._core`), a native Node addon (`@hesohq/core`), and a browser WASM module
-(`@hesohq/verify-wasm`) — so a verdict is byte-identical whether it runs on your
-server or in a reviewer's browser. Nobody re-implements canonicalization, BLAKE3,
-or Ed25519 in JS or Python.
+(`heso._core`), a native Node addon (`@hesohq/node`), and a browser WASM module
+(`@hesohq/verify-wasm`) — so a verdict is byte-identical on your server or in a
+reviewer's browser. Nobody re-implements canonicalization, BLAKE3, Ed25519, or the
+taxonomy in JS or Python; every binding is a thin layer over the one kernel.
 
-**The rule behind every design choice:** a receipt proves an action was
-_authorized_ under a known policy — and at L1 that a human _approved_ it with a
-device-held key. It does **not** prove the action _succeeded_ in the world. Never
-write code, copy, or comments that claim more. Never synthesize governance
-numbers (receipt/approval/block counts must be real or honestly empty).
+Wire constants (predicate names, taxonomy hashing, receipt field names, the
+commitment payload) are owned by the open **heso-spec** repo — cite it, don't
+hardcode a constant here that a spec bump would silently rot.
 
-All packages ship together at one version on public npm and PyPI
-(`pip install heso`, `npm install @hesohq/sdk`) — check the registry for the
-current release rather than trusting a number written here. Wire format:
-`alg = "heso-action/v2+ed25519"`, `action_version = "heso-action/2.0"`.
+## Two capture surfaces — do not conflate them
+
+| | **RECORDER** | **GATE** |
+| --- | --- | --- |
+| Hot path | **off it** — async, never blocks | **on it** — the one thing that blocks |
+| Shape | OpenTelemetry GenAI-semconv consumer | in-SDK HTTP-client shim (no proxy, no MITM CA) |
+| Failure | swallows + logs, never crashes the agent | **fail-closed** — blocks if it can't classify/sign |
+
+"Gate-is-the-capture" applies *only* to the gate: the egress interception point
+**is** the signing point for a destructive action. The recorder is best-effort
+observability that feeds the same kernel but must never couple agent latency to
+HESO latency. Full design, the rail-boundary hard floor, and `heso-mcp`:
+[references/recorder-and-gate.md](references/recorder-and-gate.md).
+
+**Two pillars, true of both surfaces** (canonical here, cross-linked elsewhere):
+
+- **Keys held customer-side.** Signing delegates to the native addon/wheel from
+  the customer keystore. **HESO holds no minting key** — not in the SDK, not in
+  the cloud (which only verifies signatures and relays detached co-signatures).
+- **Redact-before-sign.** Commit-and-reveal redaction runs *before* signing, so
+  raw content never enters the commitment and stays in the customer-held sidecar.
+
+## Classify by effect, not by name (the crown jewel)
+
+Every action that touches the world is classified, by its **structural effect**,
+into exactly one of five **destructive primitives** — never by the tool's name:
+
+| Primitive | Effect | | Primitive | Effect |
+| --- | --- | --- | --- | --- |
+| **`move-value`** | transfers value out | | **`disclose`** | sends data across a trust boundary |
+| **`destroy`** | irreversibly removes/mutates | | **`execute`** | any other effectful action |
+| **`change-authority`** | alters who can do what | | | |
+
+Plus **`observe`** (the read-only sibling of `execute`) and **`residual`** (the
+deny-unknown lane: no match ⇒ gated as the most dangerous primitive, fail-closed).
+`classify` is a **total function over a closed vocabulary**, content-addressed
+(`taxonomy_hash`) and versioned — the reason HESO is a standard, not a logging
+library. A receipt pins the taxonomy version it was signed under; verification
+checks against that pinned version forever. Full spine, predicate vocabulary,
+FROZEN-7-verb mapping, and `ClassificationMismatch`:
+[references/taxonomy.md](references/taxonomy.md).
 
 ## Pick the package first
 
-One core, four surfaces. Choose by the job, not the language.
+One core, many surfaces. Choose by the job, not the language. The Node SDK is
+**not a single `@hesohq/sdk` package** — it ships as small, separately published
+packages (`@hesohq/engine`, `@hesohq/gate`, `@hesohq/recorder`, `@hesohq/transport`)
+that all bind the same kernel through the native addon.
 
 | Package | Runtime | Use it to |
 | --- | --- | --- |
-| `heso` | Python ≥ 3.10 | **Gate** an agent — capture, policy-check, sign, audit. The deepest capture surface (most adapters, suspend/resume). |
-| `@hesohq/sdk` | Node ≥ 18 | **Gate** a Node agent (`init` + AI SDK / Mastra adapters) AND **verify** receipts + call the cloud control plane. Minting binds to `@hesohq/node`. |
-| `@hesohq/core` | Node ≥ 18 (native) | Raw primitives `@hesohq/sdk` binds to (re-exports `@hesohq/node`): verify, sign/mint, BLAKE3 hashing, chain/transparency verify, redaction, Ed25519 keys. |
-| `@hesohq/verify-wasm` | Browser | **Verify only**, client-side. No private key, no network. Also exposes in-browser policy parse/preview/floor-check. |
+| `heso` | Python ≥ 3.10 | **Record + gate** an agent (the lead binding — most adapters, suspend/resume). `import heso`, `heso.init()`, `@heso.tool` / `@heso.destructive`; `@gated` from `heso_gate`; framework adapters under `heso_recorder.adapters.*`. |
+| `@hesohq/engine` | Node ≥ 18 | The translation point (`normalizeFields`/`jsonable`/`buildAction`) + engine-FFI seam; `init()` lives here. Binds the kernel via `@hesohq/node`. |
+| `@hesohq/gate` | Node ≥ 18 | The fail-closed egress interceptor — the **only** surface that blocks. The credential floor is **default-on and transport-independent** (mints per kernel-classified destructive action, not per HTTP client). One-line egress install in **both** languages: `installGate()` (Node) / `install_gate()` (Python) arm every reachable transport process-wide. Exports `gate()` (sync classify/decide), `installGate`/`selfCheck`/`hesoGate`, + L1/quorum finalize. |
+| `@hesohq/recorder` | Node ≥ 18 | Async OTel GenAI-semconv consumer — **never blocks**. Exports `createRecorder()`; AI SDK adapter (`recordTool`/`recordTools`) at `@hesohq/recorder/adapters/ai-sdk`. |
+| `@hesohq/transport` | Node ≥ 18 | The injectable `Transport` interface + commitment wire DTOs. Zero I/O; the open packages depend only on this (the closed `@hesohq/cloud` implements it). |
+| `@hesohq/node` | Node ≥ 18 (native) | The native addon the JS packages bind for minting/verify: sign/mint, verify, BLAKE3, chain/transparency verify, redaction, Ed25519. |
+| `@hesohq/verify-wasm` | Browser | **Verify only**, client-side. No private key, no network. Also in-browser policy parse/preview/floor-check. |
 
-- "Gate my agent's actions" → **`heso`** (Python, deepest surface) or
-  **`@hesohq/sdk`** (Node: `init()` + the AI SDK / Mastra adapters, or
-  `engine.gate()` directly). Both capture, policy-check, sign, and audit
-  in-process; minting on Node binds to the native `@hesohq/node` addon.
-- "Trust a receipt from a Node service" → **`@hesohq/sdk`** (or raw `@hesohq/core`).
-- "Show a user their receipt verifies, in the browser" → **`@hesohq/verify-wasm`**.
-- Gate in Python or Node; verify anywhere — the verdict matches across every surface.
+There is **no published `@hesohq/sdk` package** — never tell a user to install one.
+Gate in Python or Node; **verify anywhere** — the verdict matches across surfaces.
+Python: [references/python.md](references/python.md). Node:
+[references/typescript.md](references/typescript.md).
 
 ## The mental model (load before writing code)
 
-- **Action** — one thing the agent did, typed by a **verb** (exactly seven):
-  `llm_call`, `tool_call`, `http_request`, `payment`, `data_export`,
-  `account_change`, `delete`. Policy and floors key off the verb.
+- **Action** — one thing the agent did, classified into a destructive primitive
+  by effect. The implemented kernel carries a coarse **verb** (`llm_call`,
+  `tool_call`, `http_request`, `payment`, `data_export`, `account_change`,
+  `delete`) that maps onto the five primitives — [references/taxonomy.md](references/taxonomy.md).
 - **Decision path** (exactly four): `allow`, `block`, `redact` (strip named
   fields, then allow), `require_approval` (route to a human).
-- **Action Receipt** — the signed JSON record of one action: a signed `content`
-  (the action detail, the policy outcome + plain-English `rule_display`, the
-  claimed `trust_level`, the BLAKE3 `action_hash`) plus an Ed25519 `signatures`
-  array. Full schema: [references/receipts.md](references/receipts.md).
+- **Action Receipt** — the signed JSON record of one action (the action detail,
+  the policy outcome + `rule_display`, the claimed `trust_level`, the BLAKE3
+  `action_hash`) plus an Ed25519 `signatures` array. Schema:
+  [references/receipts.md](references/receipts.md).
+- **Commitment** — what the SDK pushes to the **cloud**: the BLAKE3 fingerprint +
+  queryable index (primitive, rail, chain head, signatures), **not** the receipt
+  body. Raw content never leaves the customer VPC.
+  [references/cloud.md](references/cloud.md).
 - **Trust level** — `L0` = operator-signed. `L1` = operator **plus** at least one
-  human approver's co-signature from a device-held key. There is no L2/L3. Trust is
-  **re-derived on every verify** from the signatures that pass; a receipt
-  claiming L1 with only an operator signature fails `TrustLevelMismatch`. **Never
-  read `trust_level` off the wire — gate on a verified one.**
-- **L1 has two shapes — both re-derive to L1, neither is higher.**
-  - **Single-approver L1** — one human co-signs the *same* bytes the operator
-    signed (the approver record is already embedded), so the operator vouches for
-    the **whole** record, the approval included. Carried in `content.approver_decision`.
-  - **Quorum L1 (k-of-n)** — e.g. 2-of-3. The operator signs an *emptied-approvers
-    base* (just the action, the `threshold`, and the sorted `roster`); each approver
-    separately signs only their own leg. Carried in a `content.multi_approval` block —
-    that block (never the level) is how you tell quorum apart from single-approver L1.
-    It is **not** a higher level and it is honestly **narrower** per approver: the
-    operator vouches for the action + threshold + which keys are eligible, and for
-    **nothing** about any individual approval's `reason` or `decided_at`. Do **not**
-    frame quorum as "more assurance because more people signed."
+  human approver's co-signature from a device-held key. No L2/L3. Trust is
+  **re-derived on every verify** — a receipt claiming L1 with only an operator
+  signature fails `TrustLevelMismatch`. **Never read `trust_level` off the wire.**
+  L1 has two shapes (single-approver and k-of-n quorum) that both re-derive to L1
+  — told apart by which block is present, never by the level
+  ([references/receipts.md](references/receipts.md)).
 - **Audit chain** — receipts BLAKE3 hash-linked; altering an earlier receipt
   breaks every link after it.
-- **Trusted time** — **anchorless by default**: most receipts carry no trusted
-  time and `verify` reports none. `content.captured_at` is the operator's own clock,
-  **informational only** — never authoritative. An optional `content.time_anchor`
-  (RFC-3161 TSA token) binds *when the assembled, post-approval body existed*
-  (existed-no-later-than), **not** the instant a human decided — and an approver's
-  `decided_at` is approver-claimed, never TSA-certified. When a policy marks time
-  Required, an unanchored receipt fails the verifier with `AnchorRequired`.
+- **Trusted time** — **anchorless by default**: `captured_at` is the operator's
+  own clock, informational only. An optional RFC-3161 `time_anchor` binds *when
+  the assembled body existed*, not when a human decided. A policy that marks time
+  `Required` makes an unanchored receipt fail `AnchorRequired` at the verifier.
 
-## Gate an agent (Python)
+## How approvals actually happen (canonical)
 
-Scaffold once, decorate the actions, init before the agent runs. Full surface
-(suspend/resume, adapters, every kwarg): [references/python.md](references/python.md).
+When policy returns `require_approval`, the gated call **raises `SuspendedError`**
+(Python) / throws `SuspendedError(actionHash)` (Node) instead of running, and an
+approval opens keyed on `action_hash`.
 
-```bash
-pip install heso        # or: uv add heso
-heso init               # mints operator key, writes starter heso.toml, gitignores heso-local-data/
-heso demo               # mint + verify your first receipts offline (no cloud, no policy edits)
-```
+A trusted, role-gated human approves and co-signs **in their own browser/device**
+with a per-device key (the Slack card or the `/gate/[token]` web fallback). The
+**thin cloud relays the detached co-signature and holds no signing key.** The
+operator SDK fetches the relayed parts, **re-mints the L1, locally re-verifies it
+(`Valid(L1)`)**, and pushes the commitment. The **same** relay flow drives a k-of-n
+quorum — each approver co-signs their own leg in their own browser.
 
-`heso init` is zero-setup: when `HESO_KEY_PASSPHRASE` is unset it auto-generates a
-**dev-only** passphrase (`heso-local-data/DEV-ONLY.passphrase`, 0600) so the
-encrypted key unlocks with no env wrangling — `HESO_ENV=production` (or
-`--require-passphrase`) refuses to generate one and demands a real passphrase.
-The CLI is four commands: `init`, `demo`, `verify <path|hash>`, `show <hash>`.
-Full detail: [references/cli-and-api.md](references/cli-and-api.md).
+**Key rotation fails closed.** If the operator key rotates between suspend and
+finalize, the in-core assemble rejects the stale base (`OperatorKeyMismatch`) and
+the SDK **re-suspends** under the new key — a fresh suspended L0 with a new
+`action_hash` the approval re-opens against. Never a silent mint under a stale key.
 
-```python
-import heso
+**The 30-minute wall.** A suspended action races the rail-boundary credential's
+TTL (STS ≈15 min). Approval after the window **fails closed** ("credential
+expired, re-trigger"), never silently resumes. Quorum is harder under the wall —
+every co-signer lands inside one window. Where approvals live (Slack is the hero):
+[references/embeds.md](references/embeds.md).
 
-heso.init()  # load active config once, before the agent runs
+## Policy is code
 
-@heso.tool                       # captured as a tool_call action, gated, signed
-def search(query: str) -> str:
-    return web.search(query)     # body runs only if policy allows
-
-@heso.destructive                # gated as a delete — rides a pinned floor
-def delete_record(record_id: str) -> None:
-    db.delete(record_id)
-
-@heso.tool(redact=["api_key"])   # api_key commit-and-reveal redacted before signing
-def call_partner_api(api_key: str, endpoint: str) -> dict:
-    return requests.get(endpoint, headers={"Authorization": api_key}).json()
-```
-
-Non-negotiables:
-
-- **`heso.init()` must run before the agent.** Import the generated
-  `heso_bootstrap` at the top of your entrypoint, or call `heso.init()` first.
-  Config resolves: explicit args → env (`HESO_*`) → `heso.toml` → defaults.
-- **Blocking is the default.** A blocked action raises `BlockedError` *before*
-  the body runs. Pass `blocking=False` for observe-only (shadow) mode: refused
-  actions are still captured, signed, and audited, but don't raise.
-- **`require_approval` raises `SuspendedError`.** The action pauses and an
-  approval opens; the work resumes at L1 once a human co-signs. In Python the
-  error is **actionable** — it carries `action_hash` + `rule_id` and its message
-  prints the next step (the console approvals URL when one is configured, else
-  the local `@heso.gated` + `heso.append_decision` dev path). See the
-  suspend/resume API in [references/python.md](references/python.md).
-- **Console approvals (how the co-sign actually happens).** A trusted, role-gated
-  human approves the gated action in the web console and co-signs it **in the
-  browser** with a per-device WebCrypto key. The thin cloud relays the detached
-  co-signature and **holds no signing key** — and **no content body**: an action's
-  request/response body is offloaded to your own store (`put_body`), so the cloud
-  keeps only the receipt and its BLAKE3 commitment, never the raw content. The
-  operator SDK re-mints the L1,
-  locally re-verifies it (`Valid(L1)`), and pushes it. The **same** relay flow
-  drives a k-of-n quorum — each approver co-signs their own leg in their own browser.
-  When a suspension opens, the org can notify approvers out of band (Resend email +
-  HMAC-signed org webhooks, configured manager-only on the **console session plane**
-  at `GET/PUT /v1/org/notifications` — not the SDK's x-api-key plane).
-- **Key rotation fails closed.** If the operator key rotates between suspend and
-  finalize, the in-core assemble rejects the stale base (an `OperatorKeyMismatch`)
-  and the SDK **re-suspends** the action under the new key — a fresh suspended L0
-  with a new `action_hash` that the approval re-opens against. Never a silent mint
-  under a stale key.
-- **Gate a whole client with `heso.wrap()`** — gates `.create()` as `llm_call`,
-  `.request()` as `http_request`, reaches nested attrs
-  (`client.chat.completions.create(...)`), passes the rest through. **Known gap:**
-  the nested-namespace reach is being fixed and is **not reliable on the latest
-  `openai` SDK** as written — on current `openai` the
-  `client.chat.completions.create` leaf can **fail open** (the call runs ungated,
-  with **no receipt**), silently. Until the fix lands, don't rely on `wrap()` alone
-  for the OpenAI client — gate the call site explicitly (a `@heso.tool` wrapper or
-  `heso.step`) so a missed leaf can't pass through unsigned.
-- **Adapters:** `heso.HesoCallbackHandler()` for LangChain/LangGraph; `heso.wrap()`
-  for OpenAI/Anthropic; lazy namespaces `heso.crewai`, `heso.openai_agents`,
-  `heso.claude_agent`, `heso.pydantic_ai`, `heso.langgraph`, `heso.mcp`.
-
-## Gate an MCP server with zero code — `heso-mcp`
-
-The fastest way to govern an agent you don't want to touch: point any MCP client
-(Claude Desktop, Cursor, VS Code) at the `heso-mcp` proxy instead of the real
-stdio server. It spawns the real server after `--`, forwards every message
-verbatim, and intercepts only `tools/call` — running each through the same gate
-as the decorators **before** it reaches the server.
-
-```bash
-heso-mcp --project-root ~/agent -- npx -y @some/mcp-server --its --own --flags
-```
-
-- **allowed** → the signed receipt is persisted under
-  `heso-local-data/receipts/<action_hash>.json` and the request is forwarded
-  untouched; the server's result is bound back as a follow-up receipt.
-- **blocked / suspended** → the request is **never** forwarded; the client gets a
-  proper MCP tool result with `isError: true` carrying the actionable reason (the
-  responsible rule for a block; the `action_hash` to approve for a suspension).
-- an engine fault **fails closed** — the call is refused, never forwarded ungated.
-- `--observe` is mirror-only (capture + sign, never refuse). With `--api-key` /
-  `--endpoint` a suspension also opens a hosted console approval. The dev
-  passphrase file is picked up automatically (and refused under `HESO_ENV=production`).
-
-Everything that isn't a `tools/call` (`initialize`, `tools/list`, notifications,
-server stderr) passes through byte-for-byte, so the proxy is invisible to both sides.
-
-## Verify a receipt (TypeScript / Node)
-
-In Node you can both **gate** (see [references/typescript.md](references/typescript.md))
-and **verify**. This section covers verify + the cloud client.
-
-```ts
-import { gate, assertGate, isDecisionAllowed } from "@hesohq/sdk"
-
-const r = gate(receiptJson, "L0")     // { allowed, trustLevel, verdict }
-if (r.allowed) proceed()
-
-assertGate(receiptJson, "L1")          // throws unless valid AND human co-signed
-applyTransfer()
-
-if (isDecisionAllowed(receipt, ["allow", "redact"])) proceed()  // branch on policy
-```
-
-- **Verify before you trust.** Never read `trustLevel` off parsed JSON — get it
-  from `gate()`.
-- **`assertGate(json, "L1")`** before money movement or destructive ops.
-- **Push re-verifies server-side.** `pushReceipt()` sends to the cloud outbox;
-  the server re-runs the identical check and rejects a tampered body (HTTP **409**;
-  a schema-invalid body is 422). A successful push is 201, with `status`
-  `appended` / `duplicate` / `quota_exceeded`.
-- **`configure(apiKey, endpoint)` once** before any cloud call; local
-  `gate`/`assertGate` need no config and no network.
-
-## Verify in the browser (`@hesohq/verify-wasm`)
-
-```ts
-import init, { verifyActionReceipt } from "@hesohq/verify-wasm"
-await init()                                   // fetch the .wasm once; cache the promise
-const v = verifyActionReceipt(receiptBytes)    // sync after init: { verdict, trust_level }
-```
-
-ESM only, holds no private key, never signs; your app must serve the `.wasm`.
-Await `init()` exactly once. Also exposes in-browser policy tooling — `parsePolicy`,
-`policyRulesFromToml`, `ruleToSentence`, `validateNoFloorBypass` (parse / preview /
-floor-check; there is **no** decision-against-action `evaluatePolicy`).
-
-**Anyone can verify without HESO.** The public `/verify` page on heso.ca checks a
-pasted/uploaded receipt in the browser (same wasm core) with **no login** — point
-a relying party there. The wire format is openly specified (`ACTION-RECEIPT-1.0`,
-`ACTION-RECEIPT-2.0`, `TRANSPARENCY-1.0`, `HESO-1.0`) and an MIT/Apache-dual-licensed
-verifier crate + `heso-verify-cli` let third parties verify with zero HESO code.
-
-## Evidence bundles — offline, self-verifying
-
-Beyond a single receipt, the core assembles a **self-contained evidence bundle**: a
-directory (and a deterministic POSIX tar) holding the `receipts.jsonl`, a `VERIFY.sh`,
-and a `README.txt`. The relying party unpacks it and runs `./VERIFY.sh` — which
-resolves the released standalone `heso-verify-cli` and re-checks every receipt
-offline, with no HESO install and no network. The Rust entry point is
-`heso._core.evidence_bundle_tar` (consumed by the SDKs); on the cloud, Team+ orgs
-export a bundle via `POST /v1/evidence/export`. A bundle proves the same thing one
-receipt does — authorization, re-derived — never downstream success.
-
-## Policy is authored in the dashboard, not hand-written
-
-This is the part people get wrong. **Policy is built in the HESO web console**
-(`/policy`), not by hand-editing TOML. `heso.toml` is the *underlying* format the
-engine reads; the dashboard is the authoring surface and renders the exact rule
-sentences that land on receipts. Full detail (field catalog, operators, bands
-math): [references/policy.md](references/policy.md).
-
-**Importance bands.** Rules live in named bands that compile down to the engine's
-`order` (it still sorts ascending and does first-match-wins):
-
-| Band | Order range | Role |
-| --- | --- | --- |
-| **Always-on** | — (read-only) | The two pinned **floors**. Always applied, can't be turned off. Not a rule band. |
-| **Exceptions** | 0–999 | Narrowing carve-outs. Checked **first**. |
-| **Guardrails** | 1000–1999 | The core policy. |
-| **Baseline** | 2000–2999 | Catch-all defaults. Checked **last**. |
-
-You order rules by dragging within a band (the band, not raw numbers); "Add
-exception" creates a carve-out scoped above a rule. The UI flags a rule that can
-**never run** because an earlier broader rule shadows it.
-
-**Authoring a rule** = pick a verb + subject + host scope, then build conditions
-in a **field → operator → value** builder (conditions are a pure AND — all must
-hold). Operators: `gt`, `lt`, `gte`, `lte`, `eq`, `neq`, `in`, `not_in`,
-`exists`, `matches`, constrained to the field's type (`money`, `number`, `host`,
-`enum`, `bool`, `string`). The decision is `allow` / `block` / `redact` /
-`require_approval` (+ approver labels + SLA).
-
-**Simulate, then deploy.** `/policy/simulate` runs a captured action against the
-working policy and shows which rule matches and the decision — before anything
-ships. Deploying goes through a **Review & sign** bar to the Rust engine
-(`deployPolicy` → a `policy_id`); only Security Admin / Owner can deploy.
-
-**Curated packs (a starting point, not a separate engine).** HESO ships curated
-policy packs (`AI Agent Baseline`, `SOC 2`, `ISO 27001`, `HIPAA`, and — currently
-**draft / unpublished** — `ISO/IEC 42001` and `NIST AI RMF`) that **merge into the
-active policy via deploy** — they are tighten-only `require_approval` rules, so they
-can never trip the floor validator. `min_plan` gates *enforcing* a pack (free orgs
-get one starter pack: `AI Agent Baseline`; SOC 2 / packs beyond it are Pro+);
-preview and simulate stay free for everyone. Don't describe ISO 42001 / NIST AI RMF
-as live gallery packs yet.
+Policy lives in the repo as `heso.toml`, reviewed in a PR, enforced by a GitHub
+status check that lints it and **proves** invariants before merge (the GitHub
+policy-as-code embed). The web dashboard (`/policy`) is **one** authoring surface,
+**not** the home of policy — both compile to the same `heso.toml`. The engine sorts
+by ascending `order` and does **first-match-wins**. Full field catalog, bands,
+floors, simulate/deploy, packs: [references/policy.md](references/policy.md).
 
 Hard rules:
 
@@ -317,77 +183,109 @@ Hard rules:
   and routes to an approver — it is **not** a `block`, and `except BlockedError`
   will **not** catch it. There is no implicit allow-all; open lanes with `allow`
   rules. A policy gap fails safe (waits for a human), never leaks through.
-- **Pinned floors can't be allowed away.** The dangerous lanes — `payment`,
-  `delete`, `account_change`, `data_export` — carry a floor (plus a second floor:
-  a `payment` with no valid mandate). A policy may *tighten* a floor but can never
-  `allow` a dangerous lane without approval — try and the policy is rejected at
-  load with a `[FLOOR_BYPASS]` error naming the rule id and verb.
-- **`heso.toml`** is the file form (what `heso init` writes, what the local
-  Python engine reads). You *can* hand-edit it, but author in the dashboard so
-  the rule sentence you see is the one that lands on the receipt.
+  `residual` classifications from the taxonomy fail closed separately — see
+  [references/taxonomy.md](references/taxonomy.md).
+- **Pinned floors can't be allowed away.** The dangerous lanes (`payment`,
+  `delete`, `account_change`, `data_export`, plus a `payment` with no valid
+  mandate) carry an always-on floor. A policy may *tighten* a floor but never
+  `allow` a dangerous lane without approval — try and it is rejected at load with
+  `[FLOOR_BYPASS]`.
+- **Shadow Mode first.** Run the gate classify-and-sign-but-never-block to measure
+  what *would* be blocked before flipping fail-closed on.
 
-## Verification: the gates
+## The cloud — commitment store, reconciliation, proof
+
+The cloud is **not** a receipt mirror. It stores **commitments** (fingerprint +
+index, never the body), **reconciles** the signed trail against the rails' own
+ledgers (Stripe events, AWS CloudTrail), and **proves inclusion/consistency**.
+Anything in a rail ledger **without** a matching signed commitment is an
+**unwitnessed action** — the alert. The old 0–100 compliance **score is retired**;
+the wedge is inclusion proofs + reconciliation state, not a number. Full model:
+[references/cloud.md](references/cloud.md). HTTP surface:
+[references/cli-and-api.md](references/cli-and-api.md).
+
+## Verify — the gates
 
 The verifier walks gates top to bottom and stops at the **first** failure, naming
-one verdict (the PascalCase engine tag). Passing the core gates yields `Valid`.
-Full detail + the "never write your own canonicalizer" rule:
-[references/verification.md](references/verification.md).
+one PascalCase verdict; passing the core gates yields `Valid`. The seven core
+gates: algorithm recognized → version recognized → hash recomputes (BLAKE3 over
+RFC-8785 canonical bytes) → operator signature → approver signature(s) (≠ operator;
+quorum needs ≥ `threshold` distinct roster legs) → redaction well-formed → trust
+re-derives. Conditional gates add `TimeAnchorUnverifiable` / `AnchorRequired` /
+`MandateRejected` / `ClassificationMismatch`. A `Valid` verdict means exactly two
+things: the bytes are the bytes the operator signed (unaltered), and the re-derived
+trust level matches the claim. **Nothing about downstream success.** Full gate
+table + verdict strings: [references/verification.md](references/verification.md).
 
-1. **Algorithm recognized** → else `WrongAlgorithm`
-2. **Version recognized** → else `Unsupported`
-3. **Hash recomputes** (BLAKE3 over RFC-8785 canonical bytes, `action_hash`
-   stripped first) → else `HashMismatch`
-4. **Operator signature verifies** → else `InvalidSignature` (or `Malformed`)
-5. **Approver signature(s) verify** (if present) → else `InvalidSignature`; the
-   approver key must differ from the operator → else `SelfApproval`. (There is no
-   `invalid_approver` verdict.) For a quorum (`multi_approval`) receipt each leg
-   verifies under the co-sign domain against a **distinct roster key**, and trust
-   re-derives to L1 only when **≥ `threshold`** distinct legs verify — fewer than
-   that fails `ThresholdNotMet` (carries `have`/`need`, e.g. `ThresholdNotMet:have=1,need=2`).
-6. **Redaction markers well-formed** → else `MalformedRedaction`
-7. **Trust re-derives** and matches the claim → else `TrustLevelMismatch`. A quorum
-   re-derives to **L1** (with its `multi_approval` block), not a higher level.
+**Anyone can verify without HESO.** The public `/verify` page checks a pasted
+receipt in the browser with no login; an MIT/Apache-dual-licensed verifier crate +
+`heso-verify-cli` let third parties verify with zero HESO code. Evidence bundles
+(`receipts.jsonl` + `VERIFY.sh`) re-check offline — see
+[references/cloud.md](references/cloud.md).
 
-A few more gates run only when the field they check is present: a trusted-time
-`time_anchor` that does not verify → `TimeAnchorUnverifiable`; a receipt whose
-signed `anchor_policy = Required` carries **no** anchor → `AnchorRequired` (the
-offline verifier itself rejects it — not just the server); a payment mandate →
-`MandateRejected`; and (re-deriving verify only) the signed classification →
-`ClassificationMismatch` / `TaxonomyUnavailable`. A `Valid` verdict means exactly
-two things: the bytes are the bytes the operator signed (unaltered), and the
-re-derived trust level matches the claim. Nothing about downstream success.
-
-## Honesty rules (do not violate)
+## Honesty rules (do not violate — load-bearing for the assurance business)
 
 1. A receipt proves **authorization** (and at L1, human approval), never an
-   outcome.
-2. Governance numbers are real or honestly empty — never hardcoded or faked.
+   outcome. A commitment proves authorization; **reconciliation** supplies the
+   outcome side.
+2. Governance numbers are **real or honestly empty** — never hardcoded or faked.
+   There is **no compliance score** (retired); never synthesize one.
 3. Never trust a wire `trust_level` — re-derive it via verification.
 4. Never log/transmit a redacted field's value — redaction keeps only a BLAKE3
    commitment (or nothing, in destructive mode).
-5. Never hand-roll canonicalization/BLAKE3/Ed25519 — always call the core, or you
-   get false `HashMismatch` on valid receipts.
+5. Never hand-roll canonicalization/BLAKE3/Ed25519/the taxonomy — always call the
+   core, or you get false `HashMismatch` / `ClassificationMismatch` on valid
+   receipts.
+6. **No insurance vocabulary.** Coverage/claim/payout is designed-not-built
+   (Phase 2); it belongs in no code, including this skill.
+7. **Tiered honesty — the single coverage story.** State the floor's three tiers
+   exactly, never a blanket "total coverage" from the one-line install:
+   - **No forgeable receipt** — true **everywhere** (every minted receipt is
+     offline-verifiable; nobody can fake one).
+   - **Can't exceed scope** — true **given no standing key** (the floor's scoped,
+     capped, short-lived credentials bound the blast radius only while no broad
+     standing key sits in the environment — which is why the standing-key assert
+     fails closed at install).
+   - **No ungated action** — hard **only on the mediated / auto-instrumented path**;
+     elsewhere it degrades to **provably-flagged-after-the-fact** on **asymmetric
+     rails only** (CloudTrail / PayPal, third-party offline-verifiable). **HMAC
+     rails** (Stripe / GitHub / Slack) degrade further to **trust-the-rail** — the
+     rail's own ledger, no in-band proof. The one-line install NEVER implies an
+     un-mediated transport is hard-gated.
+8. **The no-standing-key keystone fails closed.** `installGate()` / `install_gate()`
+   assert no broad standing rail key is reachable, **fail-closed by default**; the
+   detector reports env-var name + rail + redacted shape only, **never the secret
+   value**. A standing key defeats the floor's whole bound, so it refuses to boot.
 
 ## When NOT to use HESO
 
 - You only need logging/metrics — HESO proves authorization, not observability.
 - You need to capture from a runtime with no HESO SDK — capture is Python and Node
   today (the browser is verify-only); you can still verify those receipts anywhere.
-- You want to assert an action's real-world effect — HESO cannot prove that.
+- You want to assert an action's real-world effect — that is what reconciliation
+  against the rail ledger is for, not a single receipt.
 
 ## References
 
-- [references/python.md](references/python.md) — full Python gating: decorators,
-  `wrap`, `step`, blocking/observe, suspend/resume, redaction, adapters, init.
-- [references/typescript.md](references/typescript.md) — Node gating (`init`,
-  AI SDK / Mastra adapters, `engine.gate`), `gate`/`assertGate`/`isDecisionAllowed`/
-  `wrap`, the cloud client, exported types.
-- [references/policy.md](references/policy.md) — UI authoring, importance bands,
-  the per-verb field catalog, operators, floors, simulate, deploy, `heso.toml`.
-- [references/receipts.md](references/receipts.md) — the full Action Receipt
-  schema, every nested type, canonicalization, a worked L1 example.
+- [references/taxonomy.md](references/taxonomy.md) — the five destructive
+  primitives, classify-by-effect, predicate vocabulary, FROZEN-7 mapping,
+  `ClassificationMismatch`. **Read first.**
+- [references/recorder-and-gate.md](references/recorder-and-gate.md) — the
+  recorder/gate split, the two pillars, the rail-boundary floor, `heso-mcp`.
+- [references/python.md](references/python.md) — Python decorators, `wrap`, `step`,
+  blocking/shadow, suspend/resume, adapters, init.
+- [references/typescript.md](references/typescript.md) — Node gating, verify,
+  `gate`/`hesoGate`/`finalizeL1`, the transport + commitment push, exported types.
+- [references/policy.md](references/policy.md) — policy-as-code, the field catalog,
+  bands, floors, simulate/deploy, packs.
+- [references/cloud.md](references/cloud.md) — commitment store, reconciliation,
+  proof, evidence bundles.
+- [references/embeds.md](references/embeds.md) — Slack approval card, GitHub
+  policy-as-code, Datadog/OTel, Vanta.
+- [references/receipts.md](references/receipts.md) — the Action Receipt schema,
+  quorum semantics, a worked L1 example.
 - [references/verification.md](references/verification.md) — the verify gates, the
-  verdict tags, byte-for-byte canonicalization, where it runs.
-- [references/cli-and-api.md](references/cli-and-api.md) — `heso` CLI, the cloud
-  HTTP API, auth, and environment variables.
+  verdict tags, canonicalization, where it runs.
+- [references/cli-and-api.md](references/cli-and-api.md) — the `heso` CLI + the
+  cloud HTTP API (`/v1/commitments`).
 - Live docs: https://heso.ca/docs

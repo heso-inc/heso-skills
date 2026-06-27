@@ -1,185 +1,247 @@
-# TypeScript / Node reference (`@hesohq/sdk`)
+# TypeScript / Node reference (split `@hesohq/*` packages)
 
-`@hesohq/sdk` (Node ≥ 18, CommonJS) does two jobs: it **gates and signs** an
-agent's actions in-process, and it **verifies** receipts and talks to the cloud
-control plane. Zero crypto in TS — it binds to the native `@hesohq/core` (verify)
-and `@hesohq/node` (mint), so a verdict here is byte-identical to a reviewer's
-browser. `@hesohq/core` ships prebuilt native binaries (darwin/linux/win) as
-optionalDependencies; minting needs `@hesohq/node` built with the `process`
-feature (loaded lazily, so verify-only deployments never need it).
+HESO ships as **several small published packages** (Node ≥ 18), not one bundle.
+There is **no `@hesohq/sdk`** — you install only the pieces you use:
+
+| Package | Job |
+| --- | --- |
+| `@hesohq/engine` | runtime config (`init`) + the engine-FFI seam; binds the Rust kernel |
+| `@hesohq/gate` | the fail-closed egress gate (`hesoGate`, `gate`, `evaluate`) — the ONLY surface that blocks |
+| `@hesohq/recorder` | the async OTel-GenAI recorder, off the hot path (`createRecorder`, `recordTool`) |
+| `@hesohq/transport` | the Transport interface + registry — the seam the cloud client plugs into |
+| `@hesohq/cloud` | the concrete cloud Transport (`configureCloud`); relays commitments to `api.heso.ca` |
+| `@hesohq/node` | the native napi addon — the Rust kernel that mints/signs (loaded lazily) |
+
+Zero crypto in TS: every canonical/signed byte is produced in the Rust kernel
+via `@hesohq/node` (loaded lazily, so a host that only records/relays and never
+mints doesn't need it). The open packages (`engine`/`gate`/`recorder`/`transport`)
+never hard-import the closed `@hesohq/cloud` — they talk to it through the
+injected `Transport`.
 
 ```bash
-pnpm add @hesohq/sdk          # verify + cloud
-pnpm add @hesohq/node         # also gate/mint (optional; the native addon)
+pnpm add @hesohq/engine @hesohq/gate @hesohq/recorder   # gate + record in-process
+pnpm add @hesohq/transport                              # the Transport seam
+pnpm add @hesohq/node                                   # native minting (the addon)
 ```
+
+There are **two capture surfaces** — the async **recorder** (off the hot path) and
+the fail-closed **gate** (the egress interceptor that blocks). The conceptual split
+and the two pillars (keys customer-side, redact-before-sign) live in
+[recorder-and-gate.md](recorder-and-gate.md); this page is the Node API.
 
 ## Gate an agent (Node)
 
-Call `init()` once, then gate tool calls — via a framework adapter or the
-`engine` capture core. The native addon mints; a blocked/suspended action throws.
+Call `init()` once (from `@hesohq/engine`), then gate. The gate is the **only
+blocking surface**: a blocked action throws `BlockedError`, a require-approval
+action throws `SuspendedError`. The recommended install is the one-liner
+**`installGate()`** (arms every reachable egress transport + the standing-key
+assert); for a single tool you can also call the synchronous **`gate()`** core.
 
 ```ts
-import { init, engine, SuspendedError } from "@hesohq/sdk"
-import { gateTool, gateTools } from "@hesohq/sdk/adapters/ai-sdk" // or .../mastra
+import { init } from "@hesohq/engine"
+import { installGate, gate, evaluate, SuspendedError } from "@hesohq/gate"
 
 init({ workflow: "vendor-payouts", account: "acct_19" })
 
-// Vercel AI SDK: gate a tool's execute BEFORE it runs.
-const tools = { search: gateTool("search", tool({ inputSchema, execute })) }
+// Recommended: ONE line arms every reachable egress transport, fail-closed.
+installGate() // undici + node:http/https + globalThis.fetch + child_process; standing-key assert ran
 
-// ...or the engine core directly:
-const action = engine.gate("transfer_funds", { amountUsd: 4200 }, { verb: "payment" })
-const result = await transferFunds({ amountUsd: 4200 })
-engine.recordResult(action, result)         // bind result to a follow-up receipt
+// ...or call the gate core directly for a single tool, before its side effect runs:
+const { action, outcome } = gate("transfer_funds", { amountUsd: 4200 }, { verb: "payment" })
+const result = await transferFunds({ amountUsd: 4200 })  // only runs if gate didn't throw
 ```
 
-- `init(options?)` — engine runtime config (projectRoot/workflow/account/
-  clockOverride/blocking); resolves explicit → `HESO_*` env → discovery → default.
-  `currentConfig()` reads it back.
-- `engine.gate(toolName, input, opts?)` — capture + drive + ENFORCE (throws
-  `BlockedError` / `SuspendedError`). `engine.evaluate(...)` — capture without
-  enforcing → `{ outcome, action }`. `engine.recordResult(action, output)`.
-- Adapters: `aiSdk.gateTool` / `aiSdk.gateTools`, `mastra.*` — thin wrappers over
-  the engine core (also at `@hesohq/sdk/adapters/*`).
-- **Two-phase approval:** `engine.gate` throws `SuspendedError(actionHash)`; out of
-  band, `waitForApproval(actionHash)` → `finalizeL1(suspendedContent, parts)`
-  assembles + mirrors the L1. A rejected decision throws `ApprovalRejectedError`.
-- **Console co-sign (how the approval is produced).** The human approves in the web
-  console and co-signs **in their browser** with a per-device WebCrypto key; the
-  thin cloud relays the detached co-signature (it holds **no** key). `getL1Parts`
-  (or `waitForApproval`) returns that relayed record + co-signature, and `finalizeL1`
-  re-mints the L1 in-core and locally re-verifies `Valid(L1)` before pushing.
-- **Quorum (k-of-n):** `getQuorumParts(actionHash)` returns all relayed legs;
-  `finalizeQuorum(suspendedContent, parts, opts?)` assembles a quorum receipt that
-  re-derives to **L1 with a `multi_approval` block** — not a higher level, and
-  honestly narrower per approver (the operator signs only action + threshold +
-  roster). Under-quorum at verify is `ThresholdNotMet`.
-- **Key rotation fails closed.** If the operator key rotates between suspend and
-  finalize, the in-core assemble rejects it (`OperatorKeyMismatchError`). Pass
-  `finalizeQuorum`'s `loadedOperatorPubkeyB64` for the proactive check and
-  `onKeyRotation` to auto-recover: it re-suspends under the new key (a fresh
-  `action_hash` via `ReSuspendResult`) instead of minting under a stale one.
+- `init(options?)` — engine runtime config (`projectRoot`/`workflow`/`account`/
+  `clockOverride`/`blocking`/`replay`/`transport`/`commitmentSigner`); resolves
+  explicit option → `HESO_*` env → discovery → built-in default. `currentConfig()`
+  reads it back; `requireConfig()` throws if `init()` hasn't run. Imported from
+  `@hesohq/engine`.
+- `installGate(options?)` — **the one-liner.** Arms EVERY transport the SDK can
+  reach (undici global dispatcher, `node:http`/`node:https`, `globalThis.fetch`,
+  `child_process`), then runs the no-standing-key assert **last** (fail-closed).
+  Idempotent (each installer is `Symbol.for`-guarded). The floor is **default-on
+  and transport-independent** — it mints per kernel-classified destructive action
+  at the credential boundary, not per HTTP client. `undici` is an optional peer dep
+  loaded lazily; `installGate()` throws if it is missing.
+- `hesoGate(options?)` — the lower-level undici interceptor for a host that composes
+  its own dispatcher. Compose it onto the global dispatcher and every fetch/undici
+  call is gated: **ALLOW** forwards unchanged, **REFUSE** (deny / require-approval /
+  any thrown pipeline error) short-circuits to a synthetic 403 that never hits the
+  network. Fail-closed by default, no log-and-continue. Imported from `@hesohq/gate`.
+- `selfCheck()` / `selfCheckOrThrow()` — the **truthful** coverage report. Per-transport
+  booleans (`undiciGated`, `nodeHttpGated`, `fetchGated`, `childProcessGated`) name the
+  **mediated** transports; `uncoveredTransports` names the **un-mediated** ones (the
+  honest gap, not a silent warnings array); `standingKeys` lists reachable findings
+  (name + rail + redacted shape, **never the value**); `escalations` aggregates both.
+  `ok` is true only when every transport is armed and no FAIL-severity standing key is
+  reachable. `selfCheckOrThrow()` refuses to boot ungated.
+- `assertNoStandingKeys(options?)` / `detectStandingKeys()` — the standing-key keystone
+  `installGate()` runs. **Fail-closed by default**: a reachable broad standing rail key
+  (`sk_live_*`, long-lived `AKIA*`, `ghp_*`, `xoxb-*`) throws `StandingKeyError` before
+  any shim arms, because a key the floor cannot bound defeats the floor. Override
+  deliberately with `installGate({ allowStandingKeys: true | string[] })` or
+  `HESO_ALLOW_STANDING_KEYS`. The detector returns env-var name + rail + redacted shape
+  only — never the secret value.
+- `gate(toolName, input, opts?)` — the synchronous fail-closed core: capture +
+  classify-by-effect + ENFORCE. Returns `{ action, outcome }` on allow; throws
+  `BlockedError` on deny and `SuspendedError(toolName, actionHash)` on
+  require-approval. The classifier maps the call against the
+  [taxonomy](taxonomy.md) into a destructive primitive before signing.
+- `evaluate(toolName, input, opts?)` — same capture + classify WITHOUT enforcing →
+  `{ outcome, action }`, so a caller can map the decision onto its own shape.
+- `classifiedVerbOf(outcome)` — the kernel-CLASSIFIED structural verb off an allowed
+  outcome (e.g. a Stripe POST classified `payment`, an S3 DELETE classified
+  `delete`), or `null`. This is the verb a hard credential floor keys off — NOT the
+  install-time `http_request` hint on `action.verb`.
 
-The deepest capture surface is still the Python SDK (more adapters, suspend/
-resume); on Node the same one Rust core does the work.
+`hesoGate({ credentialFloor })` adds the **hard credential floor** beneath the soft
+policy gate (RFC 0003): a destructive ALLOWED call only forwards after a
+just-in-time scoped, short-lived rail credential is minted customer-side; if minting
+fails the call fails CLOSED. The minted credential is ENFORCED onto the wire
+(`credentialRidesHeaders`), never silently dropped. Floor primitives + minters
+(`mintFloorCredential`, `RestrictedKeyMinter`, `StsClient`) are exported from
+`@hesohq/gate`.
 
-## Local verification (no config, no network)
+- **Two-phase approval:** `gate` throws `SuspendedError(toolName, actionHash)`
+  (phase one). Out of band, poll the cloud client (`pollApproval(actionHash)`) and on
+  approval read the relayed parts (`getL1Parts(actionHash) → L1Parts`), then
+  `finalizeL1(suspendedContent, relayedParts, keyPassphrase?)` (from `@hesohq/gate`)
+  re-mints to L1 — it asserts `approved`, assembles in-core, re-verifies `Valid(L1)`
+  locally, then relays the superseding commitment. A rejected decision throws
+  `ApprovalRejectedError`.
+- **Quorum (k-of-n):** read all legs via the cloud client's
+  `getQuorumParts(actionHash) → QuorumParts`, then
+  `finalizeQuorum(suspendedContent, relayedParts, options?)` (from `@hesohq/gate`)
+  assembles a quorum receipt that re-derives to **L1 with a `multi_approval` block**.
+  Under-quorum at verify is `ThresholdNotMet`. (Quorum semantics:
+  [receipts.md](receipts.md).)
+- **Errors:** `BlockedError`, `SuspendedError`, `ApprovalRejectedError`,
+  `OperatorKeyMismatchError` are all exported from `@hesohq/gate`.
+
+The co-sign / relay flow and the key-rotation fail-closed behavior are **one
+canonical statement** in [SKILL.md](../SKILL.md). On Node: the cloud client supplies
+the relayed parts (`pollApproval` / `getL1Parts` / `getQuorumParts`),
+`@hesohq/gate`'s `finalizeL1` / `finalizeQuorum` re-mint + locally re-verify before
+push, and `finalizeQuorum(..., { loadedOperatorPubkeyB64, onKeyRotation })` does the
+proactive rotation check + auto-re-suspend under a new key
+(`OperatorKeyMismatchError` / `ReSuspendResult`).
+
+## Record an agent (off the hot path)
+
+The recorder is the **non-blocking** surface: it consumes OTel GenAI spans, then
+fingerprints + signs + appends a commitment OFF-THREAD. The tool body runs
+unblocked. Register it ADDITIVELY — never replacing the host's existing exporters.
 
 ```ts
-import { gate, assertGate, isDecisionAllowed, shortHash } from "@hesohq/sdk"
+import { createRecorder, recordTool, recordTools } from "@hesohq/recorder"
 
-const r = gate(receiptBytes, "L0")     // GateResult — verifies bytes locally
-r.allowed      // boolean — verifies AND meets the minimum trust level
-r.trustLevel   // "L0" | "L1" | null  (null when verification fails before a level)
-r.verdict      // engine tag: "Valid" | "HashMismatch" | "TrustLevelMismatch" | ...
+const recorder = createRecorder()
 
-assertGate(receiptBytes, "L1")          // throws unless valid AND human co-signed
-
-const receipt: ActionReceipt = JSON.parse(receiptJson)
-isDecisionAllowed(receipt, ["allow", "redact"])  // branch on policy, not crypto
-
-shortHash(hex, "rcpt")  // "rcpt:9f2c4e7a" — display helper
+// Vercel AI SDK v5: wrap a tool so each execute EMITS a recorder span.
+const search = recordTool(recorder, "search", searchTool)
+const tools = recordTools(recorder, { search: searchTool, lookup: lookupTool })
 ```
 
-- `gate(receiptBytes: Buffer | string, minTrust?: TrustLevel = "L0"): GateResult`
-- `assertGate(receiptBytes: Buffer | string, minTrust?: TrustLevel = "L0"): void`
-- `isDecisionAllowed(receipt: ActionReceipt, allowed: DecisionPath[]): boolean`
+- `createRecorder(options?)` — builds the `BatchTracingProcessor`. Register it
+  additively (`addTraceProcessor(createRecorder())`), never `setTraceProcessors`.
+- `recordTool(recorder, name, tool, opts?)` — wrap one AI SDK v5 tool; each
+  `execute` emits a recorder span around the unblocked original. The tool's name is
+  supplied by the caller (AI SDK tool objects don't carry their own name). A tool
+  with no `execute` (provider/client tools) is returned unchanged. `opts`:
+  `{ captureArguments?: boolean }` (OFF by default; the recorder hashes args into the
+  fingerprint regardless of capture).
+- `recordTools(recorder, tools, opts?)` — wrap a whole `tools` record.
+- The Vercel AI SDK adapter lives at the subpath `@hesohq/recorder/adapters/ai-sdk`.
+  The `'ai'` package is never imported there — the adapter wraps a structural
+  tool-like shape (`{ execute? }`), so importing it doesn't require `ai`.
 
-`GateResult.verdict` is the PascalCase engine tag (`gate()` returns it verbatim
-from the native `verify`), NOT a snake_case string. Trust is re-derived on every
-verify — never read `trustLevel` off parsed JSON; get it from `gate()`.
+Recording is async and never blocks; **blocking egress is the gate's job**, not the
+recorder's.
 
-## Verify-on-response proxy — `wrap`
+## Cloud client — relay commitments
 
-`wrap` returns a Proxy around a client. After each method it looks for a
-`__heso_receipt` field on the result and VERIFIES it against `minTrust` (distinct
-from `engine.gate`, which captures + mints your own actions). Methods without
-`__heso_receipt` pass through unguarded.
+`@hesohq/cloud` is the concrete `Transport`. Construct it once at startup with
+`configureCloud({ apiKey, endpoint })` — this registers it as the active transport
+(via `@hesohq/transport`'s `setTransport`) so the open recorder/gate drive it. The
+api-key + endpoint live here, **off the open SDK**. The org is resolved from the
+api-key — there is **no team id**; approvals are keyed by `action_hash`. Local
+gating/recording works with **no transport** at all (an open build that never imports
+`@hesohq/cloud` gets the fail-closed stub from `@hesohq/transport`).
 
 ```ts
-import { wrap, pushReceipt } from "@hesohq/sdk"
+import { configureCloud } from "@hesohq/cloud"
 
-const guarded = wrap(agentClient, {
-  minTrust: "L1",
-  onReceipt: async (method, receiptJson) => { await pushReceipt(JSON.parse(receiptJson)) },
-  onGateFail: (method, verdict) => { console.error(`${method}: ${verdict}`); return false },
+const client = configureCloud({
+  apiKey: process.env.HESO_API_KEY!,
+  endpoint: "https://api.heso.ca",
 })
 ```
 
-`WrapOptions`: `minTrust?: TrustLevel`,
-`onReceipt?: (method, receiptJson) => void | Promise<void>`,
-`onGateFail?: (method, verdict) => boolean | Promise<boolean>` (return `true` to
-swallow the failure, `false` to throw).
+> **The transport sends a commitment, not the receipt.** The cloud client pushes a
+> **commitment** — BLAKE3 fingerprint + queryable index (primitive, rail, chain head,
+> signatures) — and **raw content stays in the customer VPC.** The cloud verifies the
+> detached signatures and proves **inclusion**; it does NOT re-run a check over a full
+> body. Full model: [cloud.md](cloud.md).
 
-## Cloud client
-
-`configure(apiKey: string, endpoint: string): void` once at startup, before any
-cloud call (separate from `init()`, which configures local minting). The org is
-resolved from the api-key — there is **no team id**; approvals are keyed by
-`action_hash`. Local `gate`/`assertGate` need no config.
+The `Transport` interface (implemented by `CloudClient`, hits `api.heso.ca` with the
+`x-api-key` header):
 
 | Method | HTTP | Returns |
 | --- | --- | --- |
-| `pullPolicy()` | GET `/v1/policy/pull` | `{ status, policyId, policyHash, toml }` |
-| `pushReceipt(receipt, supersedesActionHash?)` | POST `/v1/receipts` | `ReceiptPushResult` |
-| `pushReceipts(receipts[])` | loops POST `/v1/receipts` | `ReceiptPushResult[]` |
-| `pollApproval(actionHash)` | GET `/v1/approvals/{action_hash}` | `ApprovalView` |
-| `waitForApproval(actionHash, { pollIntervalMs?, timeoutMs? })` | polls (+ one assembly GET on approval) | `ResolvedApproval` or throws |
-| `getL1Parts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads `legs[0]`) | `L1Parts` (single-approver) |
-| `getQuorumParts(actionHash)` | GET `/v1/approvals/{action_hash}/assembly` (reads all `legs`) | `QuorumParts` (all k legs) |
-| `submitApprovalToken(actionHash, input)` | POST `/v1/approvals/{action_hash}/submit-token` | `ApprovalView` |
-
-`waitForApproval` defaults: `pollIntervalMs = 2000`, `timeoutMs = 300000`. There
-is **no batch route** — `pushReceipts` loops. `submitApprovalToken`'s `input` is a
-`SubmitTokenInput` (`{ tokenB64, actionContent, requiredScope?, decision?, ... }`),
-not a bare token string.
+| `send(commitment, supersedesActionHash?)` | POST `/v1/commitments` | `SendResult` |
+| `putBody(actionHash, receipt)` | offloads the body | `void` |
+| `pullPolicy()` | GET `/v1/policy/pull` | `PolicyPullResult` |
+| `openApproval(req)` | opens the approvals row | `ApprovalView` |
+| `pollApproval(actionHash)` | GET the approval state | `ApprovalView` |
+| `getL1Parts(actionHash)` | reads `legs[0]` of the assembly | `L1Parts` |
+| `getQuorumParts(actionHash)` | reads all `legs` of the assembly | `QuorumParts` |
+| `submitApprovalToken(actionHash, input)` | POST the co-sign token | `ApprovalView` |
+| `heartbeat(beat)` | signed coverage-interval claim | `HeartbeatResult` |
 
 ```ts
-const result = await pushReceipt(JSON.parse(receiptJson))
+const result = await client.send(commitment)
 result.status     // "appended" | "duplicate" | "quota_exceeded"
-result.entryHash  // echoes the receipt's action_hash
-result.seq        // the mirror's per-org append position
+result.entryHash  // echoes the commitment's action_hash
+result.seq        // the store's per-org append position (0 when no row was written)
 ```
 
-`ReceiptPushResult`: `{ status: "appended" | "duplicate" | "quota_exceeded",
-entryHash: string, seq: number }`. The server **re-verifies** every receipt before
-mirroring — a tampered body is rejected at the control plane, not just locally.
+The store is append-only — a re-pushed commitment is `duplicate` (idempotent),
+never an overwrite; `quota_exceeded` is the monthly soft-cap (the local chain is
+unaffected). `submitApprovalToken`'s `input` is a `SubmitTokenInput`, not a bare
+token string. Client-approval delegation (`signDelegation` /
+`mintDelegationEnvelope`, from `@hesohq/engine`) mints an operator delegation
+envelope so a customer co-signs from their own browser.
 
-Client-approval (delegation): `signDelegation` / `mintDelegationEnvelope` mint an
-operator delegation envelope so a customer co-signs from their own browser.
+## Verify a receipt (offline, no config, no network)
 
-## Exported types
+Verification is a **separate, offline** surface — it is NOT in the gate/record
+packages above. A receipt verifies anywhere from bytes alone; **`Valid` is the only
+accept.** Use one of:
 
-`ActionReceipt`, `ActionContent`, `ActionDetail`, `PolicyOutcome`,
-`SignatureEntry`, `PolicyRule`, `Approval`, `GateResult`, `ReceiptPushResult`,
-`ApprovalView`, `L1Parts`, `QuorumParts`, `Outcome`, `Action`, `TrustLevel` (`"L0" | "L1"`),
-`Verb`, `DecisionPath` (`"allow" | "block" | "redact" | "require_approval"`),
-`ConditionOp` (the receipt subset).
+- `@hesohq/verify-wasm` — browser / edge offline verify (the reviewer's browser).
+- `@hesohq/node` — the same Rust kernel as a Node addon (byte-identical verdict).
+- the `heso-verify-cli` binary — standalone, no SDK install.
 
-## Raw primitives — `@hesohq/core`
+Verdicts are PascalCase engine tags returned verbatim from the kernel; trust level is
+`L0` | `L1` only. **Never read a trust level off parsed receipt JSON — it must be
+re-derived on every verify.** See [receipts.md](receipts.md) and [verification.md](verification.md)
+for the verify API and the verdict tags.
 
-When you need the primitives directly (`@hesohq/core` re-exports the native
-`@hesohq/node`):
+## Raw primitives — `@hesohq/node`
 
-- `verify(bytes): { verdict, trustLevel }`, `verifyWithTime(bytes)` (adds a
-  `timeStatus`: `"NoTrustedTime"` when anchorless — the default — or
-  `"AnchoredRfc3161:<gen_time>"`; `gen_time` bounds when the **post-approval body**
-  existed, not when a human decided; a present-but-bad anchor fails the receipt),
-  `verifyRederiving(bytes)` (replays the signed classification).
-- Hashing/canonicalization: `contentHash`, `anchoredContentHashJs`,
-  `actionCanonicalBytesJs`, `chainHashHex`, `shortHash`, `blake3Hex`.
-- Chains: `verifyChain`, `verifySessionChainJs`,
-  `verifySessionChainWithRotationJs`, `verifyAuditChain`.
-- Transparency (RFC-6962 Merkle): `verifyInclusionJs`, `verifyConsistencyJs`.
+When you need kernel primitives directly, they live in the native `@hesohq/node`
+addon (the same crate the gate/recorder bind for minting and signing):
+
+- `verify(bytes)`, `verifyWithTime(bytes)` (adds a `timeStatus`: `"NoTrustedTime"`
+  when anchorless — the default — or `"AnchoredRfc3161:<gen_time>"`; `gen_time`
+  bounds when the **post-approval body** existed, not when a human decided),
+  `verifyRederiving(bytes)` (replays the signed classification →
+  `ClassificationMismatch`).
+- Hashing / canonicalization: `contentHash`, `chainHashHex`, `blake3Hex`.
+- Chains: `verifyChain`, `verifyAuditChain`.
+- **Transparency / proof:** `verifyInclusionJs`, `verifyConsistencyJs` (the proof
+  primitives the cloud's proof surface is built on — [cloud.md](cloud.md)).
 - Approval / delegation: `verifyApprovalToken`, `verifyDelegation`.
-- Redaction: `redactDestructiveJs`, `redactCommitJs`.
-- Keys (Ed25519): `keyFromSeed(seed)`, `generateKey()`, `OperatorKey`.
+- Keys (Ed25519): `keyFromSeed`, `generateKey`, `OperatorKey`.
 - Minting (process feature): `processAction`, `assembleL1FromParts`,
-  `assembleQuorumFromParts` (the k-of-n sibling — both re-mint to L1).
-
-## Honesty boundary
-
-A receipt proves the operator authorized the action under a known policy, and at
-L1 that a person approved it with a device-held key. It records what was
-authorized, **not** whether the action succeeded downstream. The cloud holds no
-signing key; it only re-checks signatures already on the receipt.
+  `assembleQuorumFromParts` (both re-mint to L1).

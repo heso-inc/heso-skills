@@ -9,7 +9,7 @@ receipt.
 
 ```ts
 // Node
-import { verify } from "@hesohq/core"
+import { verify } from "@hesohq/node"
 const r = verify(receiptBytes)        // { verdict, trustLevel }
 
 // Browser — await init() once first
@@ -45,7 +45,7 @@ anchor is present). Passing yields `Valid`.
 | 8 | Trusted-time anchor (if present) | RFC-3161 anchor verifies vs a pinned TSA root | `TimeAnchorUnverifiable` |
 | 9 | Trusted-time required | Signed `anchor_policy = Required` but **no** `time_anchor` present | `AnchorRequired` |
 | 10 | Payment mandate (if present) | A `payment`'s mandate binding is not invalid/absent | `MandateRejected` |
-| 11 | Classification (re-deriving verify only) | Signed ERT replays from its facts | `ClassificationMismatch` / `TaxonomyUnavailable` |
+| 11 | Classification (re-deriving verify only) | Signed destructive-primitive classification replays from the action's facts ([taxonomy.md](taxonomy.md)) | `ClassificationMismatch` / `TaxonomyUnavailable` |
 
 Because trust is the **last core** gate and is re-derived rather than read, a
 receipt can never claim more than its signatures support. A receipt with both a
@@ -74,7 +74,7 @@ All SDK surfaces return the **PascalCase engine tag**: `Valid`,
 `MandateRejected:…`, `ClassificationMismatch:…`, `TaxonomyUnavailable:…`
 (`AnchorRequired` carries no detail; `ThresholdNotMet` carries `have`/`need`).
 Node (`verify`) and the browser WASM
-(`verifyActionReceipt`) put it on `result.verdict`; `@hesohq/sdk`'s `gate()`
+(`verifyActionReceipt`) put it on `result.verdict`; `@hesohq/gate`'s `gate()`
 returns it verbatim on `GateResult.verdict`; the Python wheel returns it as the
 `kind` of a `{ kind, detail, trust_level }` dict. There is **no**
 `invalid_approver` verdict — a bad approver co-sign is `InvalidSignature`, and an
@@ -92,13 +92,16 @@ before hashing — you cannot hash a value into itself.
 **Never write your own canonicalizer.** Your own JCS that orders keys or formats
 numbers even slightly differently produces different bytes, a different BLAKE3
 hash, and a false `HashMismatch` on a receipt that is actually valid. Always
-route through the core — `@hesohq/core`, `@hesohq/verify-wasm`, or the Python `heso`
+route through the core — `@hesohq/node`, `@hesohq/verify-wasm`, or the Python `heso`
 package. Never rebuild canonical bytes by hand. The browser must call the shared
 Rust canonicalizer, not JS code.
 
-When the cloud accepts a receipt at `POST /v1/receipts` it re-verifies through
-this same core before storing — the server is not a more-trusted verifier; it runs
-the identical gates you can run locally.
+When the cloud accepts a **commitment** at `POST /v1/commitments` it verifies the
+detached signatures through this same core — but it has **no receipt body** to
+re-run the gates over (raw content stays in the customer VPC; see
+[cloud.md](cloud.md)). The server is not a more-trusted verifier: anyone with the
+receipt body runs the identical gates locally, and the cloud proves **inclusion**
+(`verifyInclusion`) rather than re-grading a mirrored body.
 
 **Anyone can verify without trusting (or installing) HESO.** The public `/verify`
 page on heso.ca checks a pasted/uploaded receipt entirely in the browser (the same
