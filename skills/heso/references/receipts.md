@@ -31,8 +31,8 @@ BLAKE3 digest of.
 | `policy` | `PolicyOutcome` | ✓ | The rule that matched and the path taken (below). |
 | `approver_decision` | `ApproverRecord` | | Present on a **single-approver** L1 (one human). Mutually exclusive with `multi_approval` — both present → `Malformed`. |
 | `multi_approval` | `MultiApproval` | | Present on a **quorum** (k-of-n) L1 (below). The block — never the level — distinguishes a quorum L1 from a single-approver L1; both re-derive to L1. |
-| `time_anchor` | `unknown` | | Optional RFC-3161 TSA token binding when the assembled post-approval body existed. Absent ⇒ no trusted time. Present-but-bad → `TimeAnchorUnverifiable`. |
-| `anchor_policy` | `"Required"` | | Signed marker that trusted time is required for this lane. If `Required` and `time_anchor` is absent → `AnchorRequired` (the offline verifier rejects it). |
+| `time_anchor` | `unknown` | | Optional RFC-3161 TSA token binding when the assembled post-approval body existed. The `heso._core` wheel can mint it (`mint_time_anchor`) via a TSA network call. Absent ⇒ `NoTrustedTime` (honest, not a failure). Present-but-bad → `TimeAnchorUnverifiable` — verified by the offline verifier **and** the browser WASM identically to Node. |
+| `anchor_policy` | `"Required"` | | Signed, on-wire marker that trusted time is required for this lane. Stamped into the signed receipt body by the engine when policy marks the lane `Required`; the **offline verifier** enforces it everywhere, not only the server. If `Required` and `time_anchor` is absent → `AnchorRequired`. |
 | `redaction` | `RedactionRecord` | | Present when fields were redacted before signing (below). |
 | `trust_level` | `"L0" \| "L1"` | ✓ | Claimed trust. Re-derived on verify; mismatch → `TrustLevelMismatch`. No L2/L3. L1 has two shapes — single-approver (`approver_decision`) and quorum (`multi_approval`) — told apart by which block is present, **never** by the level. |
 | `action_hash` | string | ✓ | BLAKE3 of the canonical content, lowercase 64-hex. Recomputed on verify; differ → `HashMismatch`. Stripped before hashing. |
@@ -40,8 +40,10 @@ BLAKE3 digest of.
 **v2 signed-content (reserved-absent).** A standalone receipt omits these and
 canonicalizes byte-identically to one minted before they existed, but `content`
 may also carry: a chain block (`session_id`, `seq`, `prev_receipt_hash`), a
-trusted-time `time_anchor` (RFC-3161 → `TimeAnchorUnverifiable` if present and
-bad) and its `anchor_policy` requirement (`Required` + no anchor → `AnchorRequired`),
+trusted-time `time_anchor` (RFC-3161 → `TimeAnchorUnverifiable` if present and bad;
+the wheel ships `mint_time_anchor` to obtain it) and its `anchor_policy` requirement
+(on-wire signed field; `Required` + no anchor → `AnchorRequired` at the offline
+verifier),
 a quorum `multi_approval` block (k-of-n → still L1), descriptive `action.domain` /
 `action.action` labels, a re-derivable `action.ert` (classification), a payment
 `action.mandate`, a `guardrail` record, and the suspend/resume `kind` /

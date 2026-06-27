@@ -152,9 +152,11 @@ blake3(rules_toml)`) that drives "update available" and a `min_plan` that gates
 ## Trusted time (optional, Required-gated)
 
 Trusted time is **off by default** — most receipts carry no anchor. A policy can
-mark trusted time **Required** for a lane; the engine then stamps the signed
-`anchor_policy = Required`, and a receipt that lane produces must carry a
-verifiable RFC-3161 `time_anchor` or it **fails verification** (`AnchorRequired`,
-enforced by the **offline verifier itself**, not only the server). The anchor
-bounds when the post-approval body existed — **not** when a human decided. See
-[verification.md](verification.md).
+mark trusted time **Required** for a lane; the engine then stamps `anchor_policy =
+Required` into the **signed receipt body on-wire** — verifier-enforceable at the
+offline verifier, not only the server. A receipt from that lane that carries no
+verifiable RFC-3161 `time_anchor` fails `AnchorRequired`. The anchor bounds when the
+post-approval body existed — **not** when a human decided. The `heso._core` wheel
+ships `mint_time_anchor` so the SDK can obtain the TSA token without an external
+binary — the policy stamp, the wheel mint, and the offline verifier enforcement are
+wired end-to-end. See [verification.md](verification.md).

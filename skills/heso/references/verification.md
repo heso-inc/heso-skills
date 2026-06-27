@@ -147,10 +147,25 @@ approval re-opens against it. The stale human co-sign cannot be replayed against
 new base.
 
 `verifyWithTime(bytes)` returns the receipt verdict **plus** a trusted-time status:
-`"NoTrustedTime"` when anchorless (the default), or `"AnchoredRfc3161:<gen_time>"`
-when a verifiable anchor is present. Read `gen_time` as an existed-no-later-than
-bound on the assembled (post-approval) body — **not** when a human decided. A
-*present* anchor that fails to verify sinks the whole receipt (`TimeAnchorUnverifiable`).
+`"NoTrustedTime"` when anchorless — no `anchor_policy` declared and no `time_anchor`
+present; this is **honest, not a failure** — or `"AnchoredRfc3161:<gen_time>"` when a
+verifiable anchor is present. Read `gen_time` as an existed-no-later-than bound on
+the assembled (post-approval) body — **not** when a human decided. A *present* anchor
+that fails to verify sinks the whole receipt (`TimeAnchorUnverifiable`).
+
+The **browser WASM** (`verifyActionReceipt` / `@hesohq/verify-wasm`) now verifies
+RFC-3161 anchors identically to Node — gate 8 runs in the browser and produces a
+real `TimeAnchorUnverifiable` on a genuinely bad token, not a placeholder label for
+all anchored receipts. The public `/verify` proof page uses this same path.
+
+**Witness honesty.** Two distinct states that must never be conflated:
+- `anchor_policy = Required` with no `time_anchor` → **`AnchorRequired`** (fail). A
+  declared requirement is enforced by every verifier surface (offline, browser,
+  server). The live third-party external witness network is **not yet live**; only
+  verifier enforcement of a declared requirement is wired.
+- No `anchor_policy`, no `time_anchor` → **`NoTrustedTime`** (honest). The receipt
+  makes no claim it cannot support. Never present this as a failure or as a
+  "witnessed" state.
 
 ## What a `Valid` verdict means
 

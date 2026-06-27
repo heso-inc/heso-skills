@@ -258,7 +258,10 @@ decorators.
 
 Capture timing (`captured_at`) is the operator's own clock — **informational only**.
 An optional RFC-3161 `time_anchor` can bind when the (post-approval) receipt body
-existed; it is off by default, so most receipts carry no trusted time.
+existed; the `heso._core` wheel ships `mint_time_anchor` for the TSA network call,
+so no external binary is needed. Trusted time is off by default; pair it with a
+policy lane marked `Required` to stamp `anchor_policy = Required` on-wire into the
+signed receipt body — the offline verifier then enforces it, not only the server.
 
 A receipt proves **authorization** (and at L1 human approval), never a downstream
 outcome — see the honesty rules in [SKILL.md](../SKILL.md).

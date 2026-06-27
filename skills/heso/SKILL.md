@@ -139,8 +139,14 @@ Python: [references/python.md](references/python.md). Node:
   breaks every link after it.
 - **Trusted time** — **anchorless by default**: `captured_at` is the operator's
   own clock, informational only. An optional RFC-3161 `time_anchor` binds *when
-  the assembled body existed*, not when a human decided. A policy that marks time
-  `Required` makes an unanchored receipt fail `AnchorRequired` at the verifier.
+  the assembled body existed*, not when a human decided. The `heso._core` wheel
+  ships a TSA-network mint (`mint_time_anchor`) so the SDK can stamp the anchor
+  without an external binary. A policy lane marked `Required` causes the engine
+  to stamp `anchor_policy = Required` into the **signed receipt body** (on-wire,
+  verifier-enforceable); a receipt from that lane carrying no `time_anchor` fails
+  `AnchorRequired` at the **offline verifier** — not only at the server.
+  **The live third-party external witness network is not yet live**; only
+  verifier enforcement of the declared requirement is wired.
 
 ## How approvals actually happen (canonical)
 
@@ -218,10 +224,12 @@ trust level matches the claim. **Nothing about downstream success.** Full gate
 table + verdict strings: [references/verification.md](references/verification.md).
 
 **Anyone can verify without HESO.** The public `/verify` page checks a pasted
-receipt in the browser with no login; an MIT/Apache-dual-licensed verifier crate +
-`heso-verify-cli` let third parties verify with zero HESO code. Evidence bundles
-(`receipts.jsonl` + `VERIFY.sh`) re-check offline — see
-[references/cloud.md](references/cloud.md).
+receipt in the browser using the same WASM core — it now verifies RFC-3161 anchors
+(gate 8) exactly as Node does; `TimeAnchorUnverifiable` is a real failure on a
+genuinely bad token, not a blanket label for any anchored receipt. No login needed.
+An MIT/Apache-dual-licensed verifier crate + `heso-verify-cli` let third parties
+verify with zero HESO code. Evidence bundles (`receipts.jsonl` + `VERIFY.sh`)
+re-check offline — see [references/cloud.md](references/cloud.md).
 
 ## Honesty rules (do not violate — load-bearing for the assurance business)
 
@@ -256,6 +264,13 @@ receipt in the browser with no login; an MIT/Apache-dual-licensed verifier crate
    assert no broad standing rail key is reachable, **fail-closed by default**; the
    detector reports env-var name + rail + redacted shape only, **never the secret
    value**. A standing key defeats the floor's whole bound, so it refuses to boot.
+9. **Witness honesty.** A receipt with `anchor_policy = Required` and no
+   `time_anchor` is a hard fail (`AnchorRequired`) — a declared requirement the
+   offline verifier enforces, not only the server. A receipt with **no declared
+   `anchor_policy`** and no `time_anchor` is **honestly unwitnessed** —
+   `verifyWithTime` returns `NoTrustedTime` and that is the correct, truthful state.
+   Never call a receipt "witnessed" from the absence of a failure. The live
+   third-party external witness network is **not yet live**.
 
 ## When NOT to use HESO
 
