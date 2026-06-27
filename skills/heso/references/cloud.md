@@ -106,11 +106,13 @@ correct:
 - `verifyInclusionJs` — a receipt is in the transparency log.
 - `verifyConsistencyJs` — the log only ever appended (no rewrite).
 
-The transparency log is moving onto **Tessera** (the commitment leaf is appended;
-the checkpoint is Tessera's native signed checkpoint; `ProofBuilder` synthesizes
-inclusion + consistency proofs from served tiles) with externally-witnessed
-checkpoint cosignatures. The commitment fits in a Tessera entry (≤64KB) trivially;
-a full receipt body would not — mechanically enforcing "raw stays in the VPC."
+<!-- Tessera migration + externally-witnessed cosignatures: superseded June 2026 —
+see heso-spec transparency.md §6. The live third-party external witness network is
+not yet active; the proof primitives below are what is actually wired. -->
+
+The commitment is appended to the transparency log and fits in a single entry
+(≤64KB) trivially; a full receipt body would not — mechanically enforcing "raw
+stays in the VPC."
 
 > **The 0–100 compliance score is retired** (and so is any `ControlVerdict`
 > met/partial/failed framing). The wedge is **inclusion/consistency proofs +

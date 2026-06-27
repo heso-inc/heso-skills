@@ -105,9 +105,11 @@ human approves and the cloud relays without holding a key) are one canonical
 statement in [SKILL.md](../SKILL.md); the language APIs are in
 [python.md](python.md) / [typescript.md](typescript.md).
 
-If a policy marks trusted time **Required**, the commitment's receipt must carry a
-verifiable RFC-3161 `time_anchor` — an unanchored one fails (`AnchorRequired`,
-422), exactly as the offline verifier rejects it.
+If a policy marks trusted time **Required**, the engine stamps `anchor_policy =
+Required` into the **signed receipt body** (on-wire, verifier-enforceable). A
+commitment whose receipt carries no verifiable RFC-3161 `time_anchor` fails
+`AnchorRequired` at the server (422) and at the offline verifier identically —
+the field is in the signed body, not a server-side runtime check.
 
 ### Status codes
 
